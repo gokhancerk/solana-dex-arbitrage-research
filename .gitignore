@@ -3,6 +3,7 @@
 .github
 node_modules
 docs
+logs
 PROJECT_PLAN.md
 PROJECT.md
 response.txt

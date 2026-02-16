@@ -24,6 +24,10 @@ TypeScript (Node 18) scaffolding for JUP/USDT arbitrage across Jupiter and OKX D
    OKX_API_PASSPHRASE=...
    OKX_API_PROJECT=...
   WALLET_KEYPATH=/absolute/path/to/your/encrypted-keypair.json
+  # Net profit gate (USDC). Trades with net profit below this are skipped.
+  MIN_NET_PROFIT_USDC=0.05
+  # Estimated SOL/USDC rate for fee conversion (safe fallback)
+  SOL_USDC_RATE=150
   # Optional: dry-run helpers
   DIRECTION=JUP_TO_OKX
   NOTIONAL_USD=50

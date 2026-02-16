@@ -7,18 +7,26 @@
     "build": "tsc --noEmit",
     "lint": "echo 'lint not configured'",
     "test": "npm run build",
+    "start": "tsx src/start.ts",
     "dry-run": "tsx src/dryRun.ts",
+    "server": "tsx src/server.ts",
     "latency": "tsx src/scripts/latencyTest.ts",
     "airdrop:devnet": "tsx src/airdrop.ts",
-    "convert-key": "tsx src/scripts/convertKey.ts"
+    "convert-key": "tsx src/scripts/convertKey.ts",
+    "dashboard": "cd dashboard && npm run dev",
+    "dashboard:build": "cd dashboard && npm run build"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",
     "bs58": "^5.0.0",
+    "cors": "^2.8.6",
     "dotenv": "^16.4.5",
+    "express": "^5.2.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.9.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",

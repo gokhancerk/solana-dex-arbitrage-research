@@ -43,10 +43,17 @@ export interface SimulatedLeg {
   simulation: SimulationOutcome;
 }
 
+export interface NetProfitInfo {
+  grossProfitUsdc: number;
+  feeUsdc: number;
+  netProfitUsdc: number;
+}
+
 export interface BuildSimulateResult {
   direction: Direction;
   legs: SimulatedLeg[];
   quoteMeta: QuoteMeta[];
+  netProfit: NetProfitInfo;
 }
 
 export interface SendAttempt {
@@ -64,6 +71,16 @@ export interface SendResult {
   failReason?: string;
 }
 
+export type TelemetryStatus =
+  | "SIMULATION_SUCCESS"
+  | "SIMULATION_FAILED"
+  | "REJECTED_LOW_PROFIT"
+  | "SLIPPAGE_EXCEEDED"
+  | "SEND_FAILED"
+  | "LIMIT_BREACH"
+  | "QUOTE_ERROR"
+  | "UNKNOWN_ERROR";
+
 export interface Telemetry {
   pair: "SOL/USDC";
   direction: Direction;
@@ -76,6 +93,14 @@ export interface Telemetry {
   timestamp: string;
   retries: number;
   profitLabel: "profit" | "loss" | "flat";
+  /** Net profit/loss in USDC after estimated fees */
+  netProfitUsdc: number;
+  /** Gross profit in USDC before fees */
+  grossProfitUsdc: number;
+  /** Estimated network fee in USDC */
+  feeUsdc: number;
+  /** Machine-readable status tag */
+  status: TelemetryStatus;
 }
 
 export class LimitBreachError extends Error {}
@@ -83,3 +108,10 @@ export class QuoteError extends Error {}
 export class SlippageError extends Error {}
 export class SimulationError extends Error {}
 export class SendError extends Error {}
+export class NetProfitRejectedError extends Error {
+  public netProfit: NetProfitInfo;
+  constructor(message: string, netProfit: NetProfitInfo) {
+    super(message);
+    this.netProfit = netProfit;
+  }
+}

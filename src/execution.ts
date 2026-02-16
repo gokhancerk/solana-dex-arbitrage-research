@@ -11,12 +11,47 @@ import {
   LimitBreachError,
   SimulationError,
   SlippageError,
-  SendError
+  SendError,
+  NetProfitRejectedError,
+  NetProfitInfo
 } from "./types.js";
 import { fetchJupiterQuote, buildJupiterSwap, computeSlippageBps, simulateJupiterTx } from "./jupiter.js";
 import { fetchOkxQuote, buildOkxSwap, simulateOkxTx } from "./okxDex.js";
+import { buildTelemetry, appendTradeLog } from "./telemetry.js";
 
 let consecutiveFailedSends = 0;
+
+// ───── Net Profit Helpers ─────
+
+/**
+ * Estimate total Solana network fee for a given number of transaction legs.
+ * Returns fee in SOL.
+ *
+ * Per-tx cost = base_fee (5000 lamports per signature) + priority_fee
+ *   priority_fee = (PRIORITY_FEE_MICROLAMPORTS * computeUnits) / 1e6
+ * We assume ~200_000 CU per transaction (typical swap CU budget).
+ */
+const BASE_FEE_LAMPORTS = 5_000;       // Solana base fee per signature
+const ASSUMED_CU_PER_TX  = 200_000;    // conservative CU budget
+
+function estimateTxFeeSol(priorityFeeMicrolamports: number | undefined, legCount: number): number {
+  const priorityLamports = priorityFeeMicrolamports
+    ? (priorityFeeMicrolamports * ASSUMED_CU_PER_TX) / 1_000_000
+    : 0;
+  const perTxLamports = BASE_FEE_LAMPORTS + priorityLamports;
+  return (perTxLamports * legCount) / 1e9; // lamports → SOL
+}
+
+function estimateFeeUsdc(feeSol: number, solUsdcRate: number): number {
+  return feeSol * solUsdcRate;
+}
+
+export interface NetProfitDecision {
+  grossProfitUsdc: number;
+  estimatedFeeUsdc: number;
+  netProfitUsdc: number;
+  approved: boolean;
+}
 
 interface BuildParams {
   direction: Direction;
@@ -210,25 +245,73 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t5}ms)`);
   }
 
-  legs.forEach((leg, idx) => {
+  // ───── Net Profit hesabı (tüm kod yollarında telemetri için ÖNCE hesapla) ─────
+  const leg2 = legs[legs.length - 1];
+  const leg2ExpectedOut = leg2.expectedOut;       // bigint — quote'tan gelen raw USDC
+  const inputRaw = amountRaw;                     // bigint — başlangıç raw USDC
+
+  console.log(
+    `[DEBUG] Net Profit hesabı — leg2.expectedOut=${leg2ExpectedOut.toString()}, ` +
+    `leg2.simulatedOut=${leg2.simulatedOut?.toString() ?? "undefined"}, ` +
+    `inputRaw=${inputRaw.toString()}`
+  );
+
+  const grossProfitRaw = leg2ExpectedOut - inputRaw;
+  const grossProfitUsdc = Number(grossProfitRaw) / 10 ** usdcDecimals;
+  const feeSol = estimateTxFeeSol(cfg.rpc.priorityFeeMicrolamports, legs.length);
+  const feeUsdc = estimateFeeUsdc(feeSol, cfg.solUsdcRate);
+  const netProfitUsdc = grossProfitUsdc - feeUsdc;
+  const netProfit: NetProfitInfo = { grossProfitUsdc, feeUsdc, netProfitUsdc };
+
+  // Telemetri için partial result — her yolda kullanılacak
+  const partialResult: BuildSimulateResult = { direction: params.direction, legs, quoteMeta, netProfit };
+
+  // ───── Slippage & Simulation kontrolleri ─────
+  for (const [idx, leg] of legs.entries()) {
     if (cfg.slippageBps && leg.effectiveSlippageBps && leg.effectiveSlippageBps > cfg.slippageBps) {
       if (params.dryRun) {
         console.warn(`[WARN] Leg ${idx + 1} (${leg.venue}): Effective slippage ${leg.effectiveSlippageBps}bps exceeds cap ${cfg.slippageBps}bps`);
       } else {
-        throw new SlippageError(`Effective slippage ${leg.effectiveSlippageBps}bps exceeds cap ${cfg.slippageBps}`);
+        const failReason = `Effective slippage ${leg.effectiveSlippageBps}bps exceeds cap ${cfg.slippageBps}`;
+        const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: false, failReason, status: "SLIPPAGE_EXCEEDED", netProfit });
+        appendTradeLog(tel);
+        throw new SlippageError(failReason);
       }
     }
     if (leg.simulation.error) {
       if (params.dryRun) {
         console.warn(`[WARN] Leg ${idx + 1} (${leg.venue}): Simulation error: ${leg.simulation.error} — dry-run devam ediyor`);
       } else {
-        throw new SimulationError(`Simulation failed: ${leg.simulation.error}`);
+        const failReason = `Simulation failed: ${leg.simulation.error}`;
+        const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: false, failReason, status: "SIMULATION_FAILED", netProfit });
+        appendTradeLog(tel);
+        throw new SimulationError(failReason);
       }
     }
-  });
+  }
+
+  // ───── Net Profit Gate ─────
+  const approved = netProfitUsdc >= cfg.minNetProfitUsdc;
+  const tag = approved ? "ONAYLANDI" : "REDDEDİLDİ";
+  console.log(
+    `[KARAR] Brüt Kâr: ${grossProfitUsdc.toFixed(6)} USDC, ` +
+    `Tahmini Fee: ${feeUsdc.toFixed(6)} USDC (${feeSol.toFixed(9)} SOL @ ${cfg.solUsdcRate}), ` +
+    `Net Kâr: ${netProfitUsdc.toFixed(6)} USDC -> İşlem [${tag}]`
+  );
+
+  if (!approved) {
+    const failReason = `Net kâr (${netProfitUsdc.toFixed(6)} USDC) minimum eşiğin (${cfg.minNetProfitUsdc} USDC) altında — işlem iptal edildi`;
+    const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: false, failReason, status: "REJECTED_LOW_PROFIT", netProfit });
+    appendTradeLog(tel);
+    throw new NetProfitRejectedError(failReason, netProfit);
+  }
+
+  // ───── Onaylandı → telemetri kaydet & return ─────
+  const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: true, status: "SIMULATION_SUCCESS", netProfit });
+  appendTradeLog(tel);
 
   console.log(`[DEBUG] buildAndSimulate tamamlandı — ${legs.length} leg`);
-  return { direction: params.direction, legs, quoteMeta };
+  return partialResult;
 }
 
 function backoffForAttempt(attempt: number): number {

@@ -26,12 +26,21 @@ export interface AppConfig {
   maxRetries: number;
   circuitBreakerThreshold: number;
   tokens: Record<string, TokenConfig>;
+  /** Minimum net profit (USDC) after fees to proceed with a trade */
+  minNetProfitUsdc: number;
+  /** Estimated SOL/USDC rate used to convert on-chain fees to USDC */
+  solUsdcRate: number;
+  /** Minimum milliseconds between consecutive API quote requests (throttle) */
+  apiCooldownMs: number;
 }
 
 export const DEFAULT_SLIPPAGE_BPS = 20; // 0.2%
-export const DEFAULT_NOTIONAL_CAP = 200; // USD stable notional
+export const DEFAULT_NOTIONAL_CAP = 1000; // USD stable notional
 export const DEFAULT_MAX_RETRIES = 3;
 export const DEFAULT_CIRCUIT_BREAKER = 3;
+export const DEFAULT_MIN_NET_PROFIT_USDC = 0.05; // 5 cents
+export const DEFAULT_SOL_USDC_RATE = 150; // conservative fallback
+export const DEFAULT_API_COOLDOWN_MS = 2000; // 2 seconds between API calls
 
 function requireEnv(name: string, optional = false): string | undefined {
   const v = process.env[name];
@@ -79,6 +88,9 @@ export function loadConfig(): AppConfig {
     notionalCapUsd: Number(process.env.NOTIONAL_CAP_USD ?? DEFAULT_NOTIONAL_CAP),
     maxRetries: Number(process.env.MAX_RETRIES ?? DEFAULT_MAX_RETRIES),
     circuitBreakerThreshold: Number(process.env.CIRCUIT_BREAKER_THRESHOLD ?? DEFAULT_CIRCUIT_BREAKER),
+    minNetProfitUsdc: Number(process.env.MIN_NET_PROFIT_USDC ?? DEFAULT_MIN_NET_PROFIT_USDC),
+    solUsdcRate: Number(process.env.SOL_USDC_RATE ?? DEFAULT_SOL_USDC_RATE),
+    apiCooldownMs: Number(process.env.API_COOLDOWN_MS ?? DEFAULT_API_COOLDOWN_MS),
     tokens
   };
 }

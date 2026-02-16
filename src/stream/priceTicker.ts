@@ -4,6 +4,7 @@ import { Direction } from "../types.js";
 import { buildAndSimulate } from "../execution.js";
 import { Keypair } from "@solana/web3.js";
 import { getKeypairFromEnv } from "../wallet.js";
+import { loadConfig } from "../config.js";
 
 /**
  * Event-driven driver: on each new slot, optionally trigger a quote/sim cycle.
@@ -16,14 +17,31 @@ export class PriceTicker {
   private slotCounter = 0;
   private readonly owner: Keypair;
   private readonly direction: Direction;
-  private readonly notionalUsd: number;
+  /** Timestamp (ms) of the last API quote request */
+  private lastCheckTime = 0;
+  /** Minimum ms between consecutive API calls (from API_COOLDOWN_MS) */
+  private readonly apiCooldownMs: number;
 
-  constructor(params: { slotsPerCheck?: number; direction: Direction; notionalUsd: number }) {
+  /**
+   * TRADE_AMOUNT_USDC env değişkeninden dinamik olarak okunur.
+   * Her tick'te güncel değeri alır; tanımsızsa varsayılan 1 USDC kullanılır.
+   */
+  private get notionalUsd(): number {
+    const raw = process.env.TRADE_AMOUNT_USDC;
+    const val = raw ? Number(raw) : 1;
+    if (Number.isNaN(val) || val <= 0) {
+      console.warn(`[PriceTicker] Geçersiz TRADE_AMOUNT_USDC="${raw}", varsayılan 1 kullanılıyor`);
+      return 1;
+    }
+    return val;
+  }
+
+  constructor(params: { slotsPerCheck?: number; direction: Direction }) {
     this.slotDriver = new SlotDriver();
     this.slotsPerCheck = params.slotsPerCheck ?? 4;
     this.owner = getKeypairFromEnv();
     this.direction = params.direction;
-    this.notionalUsd = params.notionalUsd;
+    this.apiCooldownMs = loadConfig().apiCooldownMs;
   }
 
   start() {
@@ -31,11 +49,21 @@ export class PriceTicker {
     this.slotDriver.onSlot(async (slot) => {
       this.slotCounter += 1;
       if (this.slotCounter % this.slotsPerCheck !== 0) return;
+
+      // ── Cooldown throttle: son API isteğinden beri yeterince süre geçmediyse atla ──
+      const now = Date.now();
+      if (now - this.lastCheckTime < this.apiCooldownMs) {
+        return; // slot'u görmezden gel, cooldown dolmadı
+      }
+      this.lastCheckTime = now;
+
       const startMs = performance.now();
       try {
-        await buildAndSimulate({ direction: this.direction, notionalUsd: this.notionalUsd, owner: this.owner.publicKey });
+        const result = await buildAndSimulate({ direction: this.direction, notionalUsd: this.notionalUsd, owner: this.owner.publicKey });
+        // Telemetri artık execution.ts içinde yazılıyor (her kod yolunda).
       } catch (e) {
-        // log and continue; user should plug in structured logger
+        // Telemetri artık execution.ts içinde throw'dan önce yazılıyor.
+        // Burada sadece terminale loglama yapılır.
         console.warn("price ticker sim error", e);
       } finally {
         const endMs = performance.now();

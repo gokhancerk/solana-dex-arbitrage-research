@@ -2,12 +2,26 @@ import { config as loadDotenv } from "dotenv";
 import { getConnection } from "./solana.js";
 import { buildAndSimulate } from "./execution.js";
 import { getKeypairFromEnv } from "./wallet.js";
-import { Direction } from "./types.js";
+import { Direction, NetProfitRejectedError, SimulationError, SlippageError, LimitBreachError, SendError, TelemetryStatus } from "./types.js";
 import { measureAllEndpoints, printLatencyReport } from "./latency.js";
+import { buildTelemetry, appendTradeLog } from "./telemetry.js";
+import { startServer } from "./server.js";
+
+function errorToStatus(err: unknown): TelemetryStatus {
+  if (err instanceof NetProfitRejectedError) return "REJECTED_LOW_PROFIT";
+  if (err instanceof SimulationError) return "SIMULATION_FAILED";
+  if (err instanceof SlippageError) return "SLIPPAGE_EXCEEDED";
+  if (err instanceof SendError) return "SEND_FAILED";
+  if (err instanceof LimitBreachError) return "LIMIT_BREACH";
+  return "UNKNOWN_ERROR";
+}
 
 loadDotenv();
 
 async function main() {
+  // API sunucusunu arka planda başlat
+  startServer();
+
   const owner = getKeypairFromEnv();
 
   // ── 1) RPC Latency Testi ──────────────────────────────────────────
@@ -58,7 +72,32 @@ async function main() {
       console.log(`║  P/L (raw)   = ${pnl.toString().padEnd(20)} [${pnlLabel}]            ║`);
     }
     console.log(`╚══════════════════════════════════════════════════════════╝`);
+
+    // ── Telemetri kaydı (başarılı) ──
+    const telemetry = buildTelemetry({
+      build: result,
+      direction,
+      success: true,
+      status: "SIMULATION_SUCCESS",
+      netProfit: result.netProfit,
+    });
+    await appendTradeLog(telemetry);
+    console.log(`[TELEMETRY] Kayıt logs/trades.jsonl'ye yazıldı.`);
   } catch (err) {
+    const status = errorToStatus(err);
+    const netProfit = err instanceof NetProfitRejectedError ? err.netProfit : undefined;
+
+    // ── Telemetri kaydı (başarısız) ──
+    const telemetry = buildTelemetry({
+      direction,
+      success: false,
+      failReason: err instanceof Error ? err.message : String(err),
+      status,
+      netProfit,
+    });
+    await appendTradeLog(telemetry);
+    console.log(`[TELEMETRY] Hata kaydı logs/trades.jsonl'ye yazıldı.`);
+
     console.error(`[ERROR] Swap dry-run başarısız:`, err instanceof Error ? err.message : err);
     if (err instanceof Error && err.stack) {
       console.error(`[ERROR] Stack trace:`, err.stack);

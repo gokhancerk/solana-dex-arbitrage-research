@@ -1,0 +1,8 @@
+.env
+.key
+.github
+node_modules
+docs
+PROJECT_PLAN.md
+PROJECT.md
+response.txt

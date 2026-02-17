@@ -1,27 +1,48 @@
 import { performance } from "perf_hooks";
 import { SlotDriver } from "./slotDriver.js";
-import { Direction } from "../types.js";
-import { buildAndSimulate } from "../execution.js";
+import { Direction, SendError } from "../types.js";
+import {
+  buildAndSimulate,
+  sendWithRetry,
+  estimateDirectionProfit,
+  QuoteEstimate,
+} from "../execution.js";
+import { buildTelemetry, appendTradeLog } from "../telemetry.js";
 import { Keypair } from "@solana/web3.js";
 import { getKeypairFromEnv } from "../wallet.js";
 import { loadConfig } from "../config.js";
 import { tradeLock } from "../tradeLock.js";
 
+/** Her döngüde taranacak iki yön */
+const DIRECTIONS: readonly Direction[] = ["JUP_TO_OKX", "OKX_TO_JUP"] as const;
+
+/** İnsan-okunur yön etiketi (log & telemetri) */
+function dirLabel(d: Direction): string {
+  return d === "JUP_TO_OKX" ? "JUP → OKX" : "OKX → JUP";
+}
+
 /**
- * Event-driven driver: on each new slot, optionally trigger a quote/sim cycle.
- * Backoff/throttle logic can be expanded to avoid redundant work; current implementation
- * triggers at a fixed cadence defined by slotsPerCheck.
+ * Bi-directional PriceTicker — Event-driven driver.
+ *
+ * Her uygun slot'ta iki yönü ardışık (staggered) olarak tarar,
+ * OKX rate-limit'ine (429) çarpmamak için araya STAGGER_DELAY_MS bırakır.
+ * En kârlı rotayı seçer, tam build+simulate+send yapar.
+ * Global tradeLock her iki yönü de kapsar; aynı anda sadece bir işlem çalışır.
  */
 export class PriceTicker {
   private slotDriver: SlotDriver;
   private readonly slotsPerCheck: number;
   private slotCounter = 0;
   private readonly owner: Keypair;
-  private readonly direction: Direction;
   /** Timestamp (ms) of the last API quote request */
   private lastCheckTime = 0;
   /** Minimum ms between consecutive API calls (from API_COOLDOWN_MS) */
   private readonly apiCooldownMs: number;
+  /**
+   * OKX rate-limit'ine çarpmamak için iki yön taraması arasına
+   * konulan bekleme süresi (ms). Env ile override edilebilir.
+   */
+  private readonly staggerDelayMs: number;
 
   /**
    * TRADE_AMOUNT_USDC env değişkeninden dinamik olarak okunur.
@@ -31,34 +52,39 @@ export class PriceTicker {
     const raw = process.env.TRADE_AMOUNT_USDC;
     const val = raw ? Number(raw) : 1;
     if (Number.isNaN(val) || val <= 0) {
-      console.warn(`[PriceTicker] Geçersiz TRADE_AMOUNT_USDC="${raw}", varsayılan 1 kullanılıyor`);
+      console.warn(
+        `[PriceTicker] Geçersiz TRADE_AMOUNT_USDC="${raw}", varsayılan 1 kullanılıyor`
+      );
       return 1;
     }
     return val;
   }
 
-  constructor(params: { slotsPerCheck?: number; direction: Direction }) {
+  constructor(params: { slotsPerCheck?: number }) {
     this.slotDriver = new SlotDriver();
     this.slotsPerCheck = params.slotsPerCheck ?? 4;
     this.owner = getKeypairFromEnv();
-    this.direction = params.direction;
     this.apiCooldownMs = loadConfig().apiCooldownMs;
+    this.staggerDelayMs = Number(process.env.STAGGER_DELAY_MS ?? 2000);
   }
 
   start() {
+    console.log(
+      `[PriceTicker] Çift yönlü (bi-directional) tarama aktif — ` +
+        `her tick'te JUP↔OKX staggered quote (delay=${this.staggerDelayMs}ms)`
+    );
     this.slotDriver.start();
+
     this.slotDriver.onSlot(async (slot) => {
       this.slotCounter += 1;
       if (this.slotCounter % this.slotsPerCheck !== 0) return;
 
-      // ── Cooldown throttle: son API isteğinden beri yeterince süre geçmediyse atla ──
+      // ── Cooldown throttle ──
       const now = Date.now();
-      if (now - this.lastCheckTime < this.apiCooldownMs) {
-        return; // slot'u görmezden gel, cooldown dolmadı
-      }
+      if (now - this.lastCheckTime < this.apiCooldownMs) return;
       this.lastCheckTime = now;
 
-      // ── Trade Lock: eşzamanlı işlem veya trade cooldown aktifse atla ──
+      // ── Trade Lock (global mutex — her iki yönü de kapsar) ──
       const lockResult = tradeLock.tryAcquire();
       if (!lockResult.acquired) {
         if (lockResult.skipReason === "EXECUTING") {
@@ -73,17 +99,124 @@ export class PriceTicker {
 
       const startMs = performance.now();
       try {
-        const result = await buildAndSimulate({ direction: this.direction, notionalUsd: this.notionalUsd, owner: this.owner.publicKey, dryRun: true });
-        // Telemetri artık execution.ts içinde yazılıyor (her kod yolunda).
+        const ownerStr = this.owner.publicKey.toBase58();
+        const notional = this.notionalUsd;
+
+        // ╔══════════════════════════════════════════════════════════════╗
+        // ║  ADIM 1 — Staggered quote: iki yönü ardışık tara           ║
+        // ║  OKX 429 rate-limit'ini önlemek için araya delay koyuyoruz  ║
+        // ╚══════════════════════════════════════════════════════════════╝
+        console.log(
+          `[SCAN] Slot ${slot} — iki yön staggered quote başlatılıyor (${notional} USDC, delay=${this.staggerDelayMs}ms)…`
+        );
+
+        const viable: QuoteEstimate[] = [];
+
+        for (const [i, dir] of DIRECTIONS.entries()) {
+          // İkinci yönden önce stagger delay bekle
+          if (i > 0 && this.staggerDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, this.staggerDelayMs));
+          }
+          try {
+            const q = await estimateDirectionProfit({
+              direction: dir,
+              notionalUsd: notional,
+              ownerStr,
+            });
+            console.log(
+              `[SCAN][${dirLabel(dir)}] Brüt: ${q.grossProfitUsdc.toFixed(6)} USDC | ` +
+                `Fee: ${q.estimatedFeeUsdc.toFixed(6)} USDC | ` +
+                `Net: ${q.netProfitUsdc.toFixed(6)} USDC ` +
+                (q.viable ? "✓ VİABLE" : "✗ düşük")
+            );
+            if (q.viable) viable.push(q);
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            console.warn(`[SCAN][${dirLabel(dir)}] Quote hatası: ${reason}`);
+          }
+        }
+
+        if (viable.length === 0) {
+          console.log(
+            `[SCAN] Slot ${slot} — her iki yönde de kârlı rota yok, atlanıyor`
+          );
+          return;
+        }
+
+        // ╔══════════════════════════════════════════════════════════════╗
+        // ║  ADIM 2 — En iyi rotayı seç                               ║
+        // ╚══════════════════════════════════════════════════════════════╝
+        const best = viable.reduce((a, b) =>
+          a.netProfitUsdc >= b.netProfitUsdc ? a : b
+        );
+        console.log(
+          `[SCAN] ★ Kazanan rota: ${dirLabel(best.direction)} — ` +
+            `Tahmini net kâr: ${best.netProfitUsdc.toFixed(6)} USDC`
+        );
+
+        // ╔══════════════════════════════════════════════════════════════╗
+        // ║  ADIM 3 — Tam build + simulate (kazanan yön)               ║
+        // ╚══════════════════════════════════════════════════════════════╝
+        const result = await buildAndSimulate({
+          direction: best.direction,
+          notionalUsd: notional,
+          owner: this.owner.publicKey,
+          dryRun: false,
+        });
+
+        // ╔══════════════════════════════════════════════════════════════╗
+        // ║  ADIM 4 — LIVE: İşlemi zincire gönder                     ║
+        // ╚══════════════════════════════════════════════════════════════╝
+        console.log(
+          `[LIVE][${dirLabel(best.direction)}] Net kâr onaylandı ` +
+            `(${result.netProfit.netProfitUsdc.toFixed(6)} USDC) — ` +
+            `${result.legs.length} leg gönderiliyor…`
+        );
+
+        const signatures: string[] = [];
+        for (const [idx, leg] of result.legs.entries()) {
+          console.log(
+            `[LIVE][${dirLabel(best.direction)}] Leg ${idx + 1}/${result.legs.length} ` +
+              `(${leg.venue}) gönderiliyor…`
+          );
+          const sendResult = await sendWithRetry(leg.tx, this.owner);
+          if (sendResult.finalSignature) {
+            signatures.push(sendResult.finalSignature);
+            console.log(
+              `[LIVE][${dirLabel(best.direction)}] Leg ${idx + 1} başarılı ✓ ` +
+                `sig=${sendResult.finalSignature}`
+            );
+          }
+        }
+
+        // ── Başarılı gönderim telemetrisi ──
+        const tel = buildTelemetry({
+          build: result,
+          direction: best.direction,
+          sendSignatures: signatures,
+          success: true,
+          status: "SEND_SUCCESS",
+          netProfit: result.netProfit,
+        });
+        appendTradeLog(tel);
+        console.log(
+          `[LIVE][${dirLabel(best.direction)}] Tüm leg'ler gönderildi ✓ ` +
+            `signatures=[${signatures.join(", ")}]`
+        );
       } catch (e) {
-        // Telemetri artık execution.ts içinde throw'dan önce yazılıyor.
-        // Burada sadece terminale loglama yapılır.
-        console.warn("price ticker sim error", e);
+        if (e instanceof SendError) {
+          console.error(`[LIVE][SEND_FAILED] ${e.message}`);
+        } else {
+          // Quote/slippage/sim/net profit hataları execution.ts tarafından telemetri yazılır
+          console.warn("[PriceTicker] error:", e);
+        }
       } finally {
         tradeLock.release();
         const endMs = performance.now();
         const latencyMs = Math.round(endMs - startMs);
-        console.info(`[LATENCY] Slot: ${slot} | E2E Quote & Sim Suresi: ${latencyMs}ms`);
+        console.info(
+          `[LATENCY] Slot: ${slot} | E2E Bi-Directional Cycle: ${latencyMs}ms`
+        );
       }
     });
   }

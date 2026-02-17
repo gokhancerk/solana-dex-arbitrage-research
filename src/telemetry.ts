@@ -91,6 +91,7 @@ const PERSISTABLE_STATUSES: ReadonlySet<TelemetryStatus> = new Set([
   "SIMULATION_SUCCESS",
   "DRY_RUN_PROFITABLE",
   "REJECTED_LOW_PROFIT",
+  "SEND_SUCCESS",
 ]);
 
 /**

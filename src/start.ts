@@ -1,13 +1,12 @@
 import { config as loadDotenv } from "dotenv";
 loadDotenv();
 
-import { Direction } from "./types.js";
 import { startServer } from "./server.js";
 import { PriceTicker } from "./stream/priceTicker.js";
 
 // ─── Ana başlatıcı ──────────────────────────────────────────────────
-// Express API sunucusu (dashboard için) + PriceTicker (event-driven sim döngüsü)
-// birlikte çalıştırılır. Gerçek işlem gönderimi YAPILMAZ, sadece simülasyon yapılır.
+// Express API sunucusu (dashboard için) + PriceTicker (bi-directional event-driven döngüsü)
+// birlikte çalıştırılır.
 
 const MAX_TICKER_RETRIES = 5;
 const TICKER_RETRY_BASE_MS = 3_000;
@@ -16,21 +15,20 @@ let activeTicker: PriceTicker | undefined;
 
 /** PriceTicker'ı başlat; hata olursa exponential backoff ile yeniden dene. */
 async function launchPriceTicker(attempt = 1): Promise<void> {
-  const direction = (process.env.DIRECTION as Direction) ?? "JUP_TO_OKX";
   const slotsPerCheck = Number(process.env.SLOTS_PER_CHECK ?? 4);
   const tradeAmount = process.env.TRADE_AMOUNT_USDC ?? "1";
 
   try {
     console.log(
       `[START] PriceTicker başlatılıyor (deneme ${attempt}/${MAX_TICKER_RETRIES}) — ` +
-      `direction=${direction}, TRADE_AMOUNT_USDC=${tradeAmount}, slotsPerCheck=${slotsPerCheck}`
+      `mode=BI-DIRECTIONAL (JUP↔OKX), TRADE_AMOUNT_USDC=${tradeAmount}, slotsPerCheck=${slotsPerCheck}`
     );
 
-    const ticker = new PriceTicker({ direction, slotsPerCheck });
+    const ticker = new PriceTicker({ slotsPerCheck });
     ticker.start();
     activeTicker = ticker;
 
-    console.log(`[START] PriceTicker başarıyla başlatıldı ✓`);
+    console.log(`[START] PriceTicker başarıyla başlatıldı ✓ (çift yönlü tarama aktif)`);
   } catch (err) {
     console.error(`[START] PriceTicker başlatılamadı (deneme ${attempt}):`, err);
 

@@ -15,23 +15,26 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── API Router (Express 5 uyumlu) ─────────────────────────────────
-const apiRouter = express.Router();
-
-// Auth middleware — Router seviyesinde uygulanır
-apiRouter.use((req, res, next) => {
+// ─── Auth middleware (standalone) ───────────────────────────────────
+function authCheck(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
   const token = req.headers.authorization?.replace("Bearer ", "");
-  if (!DASHBOARD_PASSWORD) {
-    return next();
-  }
-  if (token === DASHBOARD_PASSWORD) {
-    return next();
+  if (!DASHBOARD_PASSWORD || token === DASHBOARD_PASSWORD) {
+    next();
+    return;
   }
   res.status(401).json({ error: "Unauthorized" });
-});
+}
+
+// ─── API Route'ları (Router kullanmadan doğrudan app üzerinde) ──────
+// Express 5 + path-to-regexp v8'de Router mount sorunu nedeniyle
+// route'lar doğrudan app'e tam path ile tanımlanıyor.
 
 // GET /api/logs — trades.jsonl dosyasını okuyup JSON dizisi döndürür
-apiRouter.get("/logs", async (_req, res) => {
+app.get("/api/logs", authCheck, async (_req, res) => {
   try {
     let content: string;
     try {
@@ -63,9 +66,7 @@ apiRouter.get("/logs", async (_req, res) => {
 });
 
 // POST /api/logs/clear — trades.jsonl dosyasını temizler
-// Not: Express 5 + path-to-regexp v8'de DELETE method route eşleşme sorunu
-// nedeniyle POST kullanılıyor.
-apiRouter.post("/logs/clear", async (_req, res) => {
+app.post("/api/logs/clear", authCheck, async (_req, res) => {
   try {
     await fs.writeFile(TRADES_FILE, "", "utf-8");
     res.json({ success: true, message: "Tüm işlem verileri temizlendi." });
@@ -75,16 +76,11 @@ apiRouter.post("/logs/clear", async (_req, res) => {
   }
 });
 
-// Router'ı /api prefix'ine mount et
-app.use("/api", apiRouter);
-
 // ─── React Dashboard Static Files ───────────────────────────────────
 app.use(express.static(DASHBOARD_DIST));
 
 // ─── Catch-all: /api dışındaki tüm GET isteklerini React index.html'e yönlendir ──
-// Express 5 middleware yaklaşımı (path-to-regexp v8 uyumlu)
 app.use((req, res, next) => {
-  // API isteklerini veya GET olmayan istekleri atla
   if (req.path.startsWith("/api") || req.method !== "GET") {
     return next();
   }

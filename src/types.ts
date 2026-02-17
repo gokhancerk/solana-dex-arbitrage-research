@@ -74,6 +74,7 @@ export interface SendResult {
 export type TelemetryStatus =
   | "SIMULATION_SUCCESS"
   | "SIMULATION_FAILED"
+  | "DRY_RUN_PROFITABLE"
   | "REJECTED_LOW_PROFIT"
   | "SLIPPAGE_EXCEEDED"
   | "SEND_FAILED"

@@ -38,7 +38,7 @@ export const DEFAULT_SLIPPAGE_BPS = 20; // 0.2%
 export const DEFAULT_NOTIONAL_CAP = 1000; // USD stable notional
 export const DEFAULT_MAX_RETRIES = 3;
 export const DEFAULT_CIRCUIT_BREAKER = 3;
-export const DEFAULT_MIN_NET_PROFIT_USDC = 0.05; // 5 cents
+export const DEFAULT_MIN_NET_PROFIT_USDC = 0.10; // 10 cents (~0.04% on $240)
 export const DEFAULT_SOL_USDC_RATE = 150; // conservative fallback
 export const DEFAULT_API_COOLDOWN_MS = 2000; // 2 seconds between API calls
 

@@ -13,7 +13,8 @@ import {
   SlippageError,
   SendError,
   NetProfitRejectedError,
-  NetProfitInfo
+  NetProfitInfo,
+  TelemetryStatus
 } from "./types.js";
 import { fetchJupiterQuote, buildJupiterSwap, computeSlippageBps, simulateJupiterTx } from "./jupiter.js";
 import { fetchOkxQuote, buildOkxSwap, simulateOkxTx } from "./okxDex.js";
@@ -89,6 +90,25 @@ async function simulateLeg(leg: SimulatedLeg, venue: "JUPITER" | "OKX") {
   return { ...leg, simulation: sim, simulatedOut, effectiveSlippageBps };
 }
 
+/**
+ * Dry-run-safe wrapper: catches simulation RPC errors (e.g. AccountNotFound)
+ * and records them as leg.simulation.error instead of throwing.
+ * This allows the net profit calculation to proceed with quote-based estimates.
+ */
+async function simulateLegSafe(leg: SimulatedLeg, venue: "JUPITER" | "OKX", dryRun: boolean): Promise<SimulatedLeg> {
+  try {
+    return await simulateLeg(leg, venue);
+  } catch (err) {
+    if (dryRun) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.warn(`[WARN] ${venue} simülasyonu hata fırlattı: ${errorMsg} — dry-run devam ediyor`);
+      leg.simulation = { ...leg.simulation, error: errorMsg };
+      return leg;
+    }
+    throw err;
+  }
+}
+
 export async function buildAndSimulate(params: BuildParams): Promise<BuildSimulateResult> {
   const cfg = loadConfig();
   console.log(`[DEBUG] buildAndSimulate başladı — direction=${params.direction}, notional=${params.notionalUsd}`);
@@ -134,7 +154,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
     console.log("[DEBUG] Jupiter TX simüle ediliyor...");
     const t2 = Date.now();
-    legs.push(await simulateLeg(jupLeg, "JUPITER"));
+    legs.push(await simulateLegSafe(jupLeg, "JUPITER", params.dryRun ?? false));
     console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t2}ms)`);
 
     console.log("[DEBUG] Leg 2/2 — OKX quote isteniyor...");
@@ -172,7 +192,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
     console.log("[DEBUG] OKX TX simüle ediliyor...");
     const t5 = Date.now();
-    legs.push(await simulateLeg(okxLeg, "OKX"));
+    legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
     console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t5}ms)`);
   } else {
     console.log("[DEBUG] Leg 1/2 — OKX quote isteniyor...");
@@ -210,7 +230,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
     console.log("[DEBUG] OKX TX simüle ediliyor...");
     const t2 = Date.now();
-    legs.push(await simulateLeg(okxLeg, "OKX"));
+    legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
     console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t2}ms)`);
 
     console.log("[DEBUG] Leg 2/2 — Jupiter quote isteniyor...");
@@ -241,7 +261,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
     console.log("[DEBUG] Jupiter TX simüle ediliyor...");
     const t5 = Date.now();
-    legs.push(await simulateLeg(jupLeg, "JUPITER"));
+    legs.push(await simulateLegSafe(jupLeg, "JUPITER", params.dryRun ?? false));
     console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t5}ms)`);
   }
 
@@ -305,7 +325,10 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
   }
 
   // ───── Onaylandı → telemetri kaydet & return ─────
-  const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: true, status: "SIMULATION_SUCCESS", netProfit });
+  const hasSimErrors = legs.some(l => l.simulation.error);
+  const finalStatus: TelemetryStatus = (hasSimErrors && params.dryRun) ? "DRY_RUN_PROFITABLE" : "SIMULATION_SUCCESS";
+  const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: !hasSimErrors, status: finalStatus, netProfit,
+    failReason: hasSimErrors ? legs.filter(l => l.simulation.error).map(l => `${l.venue}: ${l.simulation.error}`).join('; ') : undefined });
   appendTradeLog(tel);
 
   console.log(`[DEBUG] buildAndSimulate tamamlandı — ${legs.length} leg`);

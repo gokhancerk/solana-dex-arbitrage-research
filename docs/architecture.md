@@ -32,14 +32,49 @@ Jupiter (jup.ag) ve OKX DEX arasında **SOL/USDC** paritesinde fiyat farklarınd
 ## İki Yönlü Arbitraj Akışı
 
 ### Yön 1: `JUP_TO_OKX`
-1. USDT → JUP swap (Jupiter üzerinden)
-2. JUP → USDT swap (OKX DEX üzerinden)
-3. Net USDT farkı = kâr/zarar
+1. USDC → SOL swap (Jupiter üzerinden)
+2. SOL → USDC swap (OKX DEX üzerinden)
+3. Net USDC farkı = kâr/zarar
 
 ### Yön 2: `OKX_TO_JUP`
-1. USDT → JUP swap (OKX DEX üzerinden)
-2. JUP → USDT swap (Jupiter üzerinden)
-3. Net USDT farkı = kâr/zarar
+1. USDC → SOL swap (OKX DEX üzerinden)
+2. SOL → USDC swap (Jupiter üzerinden)
+3. Net USDC farkı = kâr/zarar
+
+## Net Profit Hesaplama Akışı
+
+Her `buildAndSimulate()` çağrısında iki bacak tamamlandıktan sonra:
+
+```
+inputRaw = toRaw(notionalUsd, 6)        // Başlangıç USDC (raw bigint)
+         │
+Leg 1:   USDC → SOL  (quote: expectedOut = SOL lamport)
+         │
+Leg 2:   SOL → USDC  (quote: expectedOut = USDC raw)
+         │
+grossProfitRaw  = leg2.expectedOut − inputRaw
+grossProfitUsdc = grossProfitRaw / 10^6
+         │
+feeSol  = (BASE_FEE + priorityFee × CU) × legCount / 1e9
+feeUsdc = feeSol × solUsdcRate
+         │
+netProfitUsdc = grossProfitUsdc − feeUsdc
+         │
+         ├── ≥ minNetProfitUsdc  →  İşlem ONAYLANDI
+         └── < minNetProfitUsdc  →  NetProfitRejectedError
+```
+
+### Örnek Hesaplama (240 USDC, JUP_TO_OKX)
+
+| Adım | Değer |
+|---|---|
+| inputRaw | 240,000,000 (240 USDC) |
+| Leg 1 (Jupiter USDC→SOL) | expectedOut = 2,832,716,434 lamports (~2.83 SOL) |
+| Leg 2 (OKX SOL→USDC) | expectedOut = 240,192,647 (~240.19 USDC) |
+| grossProfitRaw | 192,647 |
+| grossProfitUsdc | +0.192647 USDC |
+| feeUsdc | −0.002100 USDC (2 TX × 5000 lamports base + priority) |
+| **netProfitUsdc** | **+0.190547 USDC → ONAYLANDI** |
 
 ## Güvenlik Katmanları
 
@@ -48,9 +83,11 @@ Jupiter (jup.ag) ve OKX DEX arasında **SOL/USDC** paritesinde fiyat farklarınd
 | Slippage Cap | Simülasyonda kontrol | ≤ 0.2% (20 bps) |
 | Notional Cap | İşlem öncesi kontrol | ≤ 200 USDT |
 | Simülasyon | TX gönderiminden önce zorunlu | Her TX |
+| **Net Profit Gate** | **Brüt kâr − tahmini fee ≥ eşik** | **≥ 0.05 USDC (yapılandırılabilir)** |
 | Retry + Backoff | Üssel geri çekilme | Maks 3 deneme |
 | Circuit Breaker | Ardışık başarısız gönderim | 3 → durdur |
 | Priority Fee | MEV koruması | Ayarlanabilir |
+| DryRun Modu | Simülasyon hataları uyarı olarak loglanır | PriceTicker daima `dryRun: true` |
 
 ## Dosya Yapısı
 
@@ -117,9 +154,16 @@ ecosystem.config.cjs     # PM2 süreç yapılandırması
               Slippage kontrolü (≤ 20 bps)
                         │
                         ▼
-              sendWithRetry() [canlı mod]
-                        │
-                        ▼
+              Net Profit Gate
+              (brüt kâr − fee ≥ minNetProfitUsdc?)
+                    │           │
+               ONAYLANDI    REDDEDİLDİ
+                    │           │
+                    ▼           ▼
+              sendWithRetry()  Telemetri kaydet
+              [canlı mod]     + NetProfitRejectedError
+                    │
+                    ▼
               buildTelemetry() → JSON çıktı
 ```
 
@@ -144,7 +188,7 @@ Frontend ve backend tek bir Express sunucusu üzerinden (port 3001) sunulur:
 | Blockchain | Solana (mainnet-beta) |
 | SDK | @solana/web3.js ^1.95 |
 | DEX 1 | Jupiter Aggregator API v6 |
-| DEX 2 | OKX DEX Aggregate API v5 |
+| DEX 2 | OKX DEX Aggregator API v6 |
 | Backend | Express 5, CORS |
 | Frontend | React 19, Vite, Tailwind CSS, shadcn/ui, recharts |
 | Çevre Değişkenleri | dotenv |

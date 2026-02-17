@@ -82,11 +82,32 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
 // ───── JSONL Logging ─────
 
 /**
+ * Only these statuses are persisted to trades.jsonl.
+ * Other statuses (SIMULATION_FAILED, SLIPPAGE_EXCEEDED, SEND_FAILED,
+ * LIMIT_BREACH, QUOTE_ERROR, UNKNOWN_ERROR) are emitted as console.warn
+ * to reduce I/O and keep the log file clean with actionable entries only.
+ */
+const PERSISTABLE_STATUSES: ReadonlySet<TelemetryStatus> = new Set([
+  "SIMULATION_SUCCESS",
+  "REJECTED_LOW_PROFIT",
+]);
+
+/**
  * Append a telemetry record to `logs/trades.jsonl` (non-blocking).
  * Creates the `logs/` directory on first call if it doesn't exist.
  * Wrapped in try/catch so I/O errors never crash the main loop.
+ *
+ * Only entries with a persistable status are written to disk.
+ * All others are logged to console.warn for observability without I/O cost.
  */
 export async function appendTradeLog(entry: Telemetry): Promise<void> {
+  if (!PERSISTABLE_STATUSES.has(entry.status)) {
+    console.warn(
+      `[TELEMETRY][SKIP] status=${entry.status} dosyaya yazılmadı — reason: ${entry.failReason ?? "n/a"}`
+    );
+    return;
+  }
+
   try {
     await ensureLogsDir();
     const line = JSON.stringify(entry) + "\n";

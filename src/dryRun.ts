@@ -86,19 +86,19 @@ async function main() {
   } catch (err) {
     const status = errorToStatus(err);
     const netProfit = err instanceof NetProfitRejectedError ? err.netProfit : undefined;
+    const failReason = err instanceof Error ? err.message : String(err);
 
-    // ── Telemetri kaydı (başarısız) ──
+    // ── Telemetri kaydı (başarısız) — appendTradeLog içinde filtrelenir ──
     const telemetry = buildTelemetry({
       direction,
       success: false,
-      failReason: err instanceof Error ? err.message : String(err),
+      failReason,
       status,
       netProfit,
     });
     await appendTradeLog(telemetry);
-    console.log(`[TELEMETRY] Hata kaydı logs/trades.jsonl'ye yazıldı.`);
 
-    console.error(`[ERROR] Swap dry-run başarısız:`, err instanceof Error ? err.message : err);
+    console.error(`[ERROR] Swap dry-run başarısız:`, failReason);
     if (err instanceof Error && err.stack) {
       console.error(`[ERROR] Stack trace:`, err.stack);
     }

@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { promises as fs } from "fs";
@@ -5,9 +6,24 @@ import path from "path";
 
 const PORT = Number(process.env.API_PORT ?? 3001);
 const TRADES_FILE = path.resolve(process.cwd(), "logs", "trades.jsonl");
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD ?? "";
 
 const app = express();
 app.use(cors());
+
+// ─── Auth Middleware ────────────────────────────────────────────────
+// Authorization header'ı ile .env'deki şifreyi karşılaştırır.
+app.use("/api", (req, res, next) => {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (!DASHBOARD_PASSWORD) {
+    // Şifre tanımlı değilse korumayı devre dışı bırak
+    return next();
+  }
+  if (token === DASHBOARD_PASSWORD) {
+    return next();
+  }
+  res.status(401).json({ error: "Unauthorized" });
+});
 
 // ─── GET /api/logs ──────────────────────────────────────────────────
 // logs/trades.jsonl dosyasını okuyup her satırı parse eder, JSON dizisi döndürür.

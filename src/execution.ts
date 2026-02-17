@@ -273,8 +273,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
         console.warn(`[WARN] Leg ${idx + 1} (${leg.venue}): Effective slippage ${leg.effectiveSlippageBps}bps exceeds cap ${cfg.slippageBps}bps`);
       } else {
         const failReason = `Effective slippage ${leg.effectiveSlippageBps}bps exceeds cap ${cfg.slippageBps}`;
-        const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: false, failReason, status: "SLIPPAGE_EXCEEDED", netProfit });
-        appendTradeLog(tel);
+        console.warn(`[TELEMETRY][SKIP] SLIPPAGE_EXCEEDED dosyaya yazılmadı — ${failReason}`);
         throw new SlippageError(failReason);
       }
     }
@@ -283,8 +282,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
         console.warn(`[WARN] Leg ${idx + 1} (${leg.venue}): Simulation error: ${leg.simulation.error} — dry-run devam ediyor`);
       } else {
         const failReason = `Simulation failed: ${leg.simulation.error}`;
-        const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: false, failReason, status: "SIMULATION_FAILED", netProfit });
-        appendTradeLog(tel);
+        console.warn(`[TELEMETRY][SKIP] SIMULATION_FAILED dosyaya yazılmadı — ${failReason}`);
         throw new SimulationError(failReason);
       }
     }

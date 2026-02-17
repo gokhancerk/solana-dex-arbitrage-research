@@ -8,6 +8,9 @@ const PORT = Number(process.env.API_PORT ?? 3001);
 const TRADES_FILE = path.resolve(process.cwd(), "logs", "trades.jsonl");
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD ?? "";
 
+// React build çıktısının yolu (dashboard/dist)
+const DASHBOARD_DIST = path.resolve(process.cwd(), "dashboard", "dist");
+
 const app = express();
 app.use(cors());
 
@@ -59,10 +62,24 @@ app.get("/api/logs", async (_req, res) => {
   }
 });
 
+// ─── React Dashboard Static Files ───────────────────────────────────
+app.use(express.static(DASHBOARD_DIST));
+
+// ─── Catch-all: /api dışındaki tüm GET isteklerini React index.html'e yönlendir ──
+// Express 5 middleware yaklaşımı (path-to-regexp v8 uyumlu)
+app.use((req, res, next) => {
+  // API isteklerini veya GET olmayan istekleri atla
+  if (req.path.startsWith("/api") || req.method !== "GET") {
+    return next();
+  }
+  res.sendFile(path.join(DASHBOARD_DIST, "index.html"));
+});
+
 // ─── Start helper ───────────────────────────────────────────────────
 export function startServer(): void {
-  app.listen(PORT, () => {
-    console.log(`[API] Express sunucusu http://localhost:${PORT} adresinde çalışıyor`);
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[API] Express sunucusu http://0.0.0.0:${PORT} adresinde çalışıyor`);
+    console.log(`[API] Dashboard: ${DASHBOARD_DIST}`);
   });
 }
 

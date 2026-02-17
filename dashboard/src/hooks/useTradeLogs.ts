@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { TradeLog } from "@/types";
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
 const MAX_RETRIES = 3;
 const BASE_DELAY = 1000;
 
@@ -28,7 +27,7 @@ export function useTradeLogs(token: string | null, intervalMs = 15000): UseTrade
     }
     try {
       setLoading(true);
-      const res = await fetch(`${API_URL}/api/logs`, {
+      const res = await fetch(`/api/logs`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.status === 401) {

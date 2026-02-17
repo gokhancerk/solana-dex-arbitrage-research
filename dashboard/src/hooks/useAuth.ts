@@ -1,7 +1,6 @@
 import { useState, useCallback } from "react";
 
 const STORAGE_KEY = "dashboard_token";
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
 
 export function useAuth() {
   const [token, setToken] = useState<string | null>(
@@ -14,7 +13,7 @@ export function useAuth() {
     setLoading(true);
     setLoginError(null);
     try {
-      const res = await fetch(`${API_URL}/api/logs`, {
+      const res = await fetch(`/api/logs`, {
         headers: { Authorization: `Bearer ${password}` },
       });
       if (res.status === 401) {

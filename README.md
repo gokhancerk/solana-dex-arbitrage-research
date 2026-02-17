@@ -88,10 +88,10 @@ Instead of polling quotes, hook into Solana slots via Helius WebSocket and trigg
 ```
 import { PriceTicker } from "./src/stream/priceTicker.js";
 
-// every 4 slots (~2s) run build+simulate for the chosen direction/notional
-new PriceTicker({ slotsPerCheck: 4, direction: "JUP_TO_OKX", notionalUsd: 50 }).start();
+// every 4 slots (~2s) run bi-directional quote scan (JUP↔OKX) and execute the best route
+new PriceTicker({ slotsPerCheck: 4 }).start();
 ```
-Set `SOLANA_WS_PRIMARY` / `SOLANA_WS_BACKUP` (Helius URLs) in `.env`. Extend the callback to add spread checks and sending logic.
+Set `SOLANA_WS_PRIMARY` / `SOLANA_WS_BACKUP` (Helius URLs) in `.env`. The ticker automatically scans both JUP→OKX and OKX→JUP directions in parallel and picks the most profitable route.
 
 ## Telemetry Shape
 

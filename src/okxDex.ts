@@ -13,6 +13,89 @@ import { simulateTx, getConnection } from "./solana.js";
 /** OKX API istekleri için varsayılan timeout (ms) */
 const OKX_FETCH_TIMEOUT_MS = 15_000;
 
+// ── OKX Rate Limiter ────────────────────────────────────────────────
+/** Ardışık OKX API çağrıları arasında minimum bekleme süresi (ms) */
+const OKX_MIN_CALL_SPACING_MS = 600;
+/** 429 hatası alındığında max retry sayısı */
+const OKX_429_MAX_RETRIES = 2;
+/** 429 retry backoff base (ms) — exponential: base * 2^(attempt-1) */
+const OKX_429_BACKOFF_BASE_MS = 800;
+
+/** Son OKX API çağrısının timestamp'i */
+let lastOkxCallTimestamp = 0;
+
+/**
+ * OKX API çağrılarını rate-limit'e takılmamak için
+ * minimum aralık bırakarak throttle eder.
+ */
+async function okxRateThrottle(): Promise<void> {
+  const now = Date.now();
+  const elapsed = now - lastOkxCallTimestamp;
+  if (elapsed < OKX_MIN_CALL_SPACING_MS) {
+    const waitMs = OKX_MIN_CALL_SPACING_MS - elapsed;
+    console.log(`[OKX-RATE] ${waitMs}ms bekleniyor (rate-limit koruması)…`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  lastOkxCallTimestamp = Date.now();
+}
+
+/**
+ * 429 "Too Many Requests" hatasına karşı retry + exponential backoff.
+ * Yalnızca 429 HTTP status'unda tekrar dener, diğer hatalarda doğrudan throw eder.
+ */
+async function fetchWithOkx429Retry(
+  url: string,
+  headers: Record<string, string>,
+  label: string
+): Promise<Response> {
+  for (let attempt = 0; attempt <= OKX_429_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const backoffMs = OKX_429_BACKOFF_BASE_MS * 2 ** (attempt - 1);
+      console.warn(
+        `[OKX-RETRY] ${label} — 429 retry ${attempt}/${OKX_429_MAX_RETRIES}, ` +
+        `${backoffMs}ms backoff bekleniyor…`
+      );
+      await new Promise((r) => setTimeout(r, backoffMs));
+      // Retry öncesi yeni HMAC timestamp gerekli olabilir, ancak
+      // kısa backoff süreleri OKX timestamp tolerance (30s) içinde kalır.
+      lastOkxCallTimestamp = Date.now();
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(OKX_FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `OKX ${label} fetch failed (timeout=${OKX_FETCH_TIMEOUT_MS}ms): ${reason}`
+      );
+    }
+
+    if (res.status === 429) {
+      const bodyText = await res.text().catch(() => "");
+      console.warn(
+        `[OKX-RATE] ${label} HTTP 429 alındı (attempt ${attempt + 1}/${OKX_429_MAX_RETRIES + 1}): ${bodyText}`
+      );
+      if (attempt === OKX_429_MAX_RETRIES) {
+        throw new Error(
+          `OKX ${label} rate-limited: 429 Too Many Requests — ` +
+          `${OKX_429_MAX_RETRIES + 1} deneme sonrası başarısız`
+        );
+      }
+      continue; // retry
+    }
+
+    return res;
+  }
+
+  // TypeScript exhaustiveness — buraya ulaşılmamalı
+  throw new Error(`OKX ${label}: unexpected retry loop exit`);
+}
+
 // ── OKX DEX Aggregator v6 endpoints (GET) ───────────────────────────
 const OKX_QUOTE_PATH = "/api/v6/dex/aggregator/quote";
 const OKX_SWAP_INSTRUCTION_PATH = "/api/v6/dex/aggregator/swap-instruction";
@@ -123,22 +206,13 @@ export async function fetchOkxQuote(
   const fullUrl = `${cfg.okxBaseUrl}${requestPath}`;
   console.log(`[DEBUG] OKX Quote Request URL: ${fullUrl}`);
 
+  // Rate-limit koruması: minimum çağrı aralığını zorla
+  await okxRateThrottle();
+
   const headers = buildOkxHeaders("GET", requestPath);
 
-  let res: Response;
-  try {
-    res = await fetch(fullUrl, {
-      method: "GET",
-      headers,
-      signal: AbortSignal.timeout(OKX_FETCH_TIMEOUT_MS),
-    });
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    console.error(`[ERROR] OKX quote fetch hatası: ${reason}`);
-    throw new Error(
-      `OKX quote fetch failed (timeout=${OKX_FETCH_TIMEOUT_MS}ms): ${reason}`
-    );
-  }
+  // 429 retry mekanizmalı fetch
+  const res = await fetchWithOkx429Retry(fullUrl, headers, "quote");
 
   if (!res.ok) {
     const bodyText = await res.text().catch(() => "(body okunamadı)");
@@ -197,22 +271,13 @@ export async function buildOkxSwap(
   const fullUrl = `${cfg.okxBaseUrl}${requestPath}`;
   console.log(`[DEBUG] OKX Swap-Instruction Request URL: ${fullUrl}`);
 
+  // Rate-limit koruması: minimum çağrı aralığını zorla
+  await okxRateThrottle();
+
   const headers = buildOkxHeaders("GET", requestPath);
 
-  let res: Response;
-  try {
-    res = await fetch(fullUrl, {
-      method: "GET",
-      headers,
-      signal: AbortSignal.timeout(OKX_FETCH_TIMEOUT_MS),
-    });
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    console.error(`[ERROR] OKX swap-instruction fetch hatası: ${reason}`);
-    throw new Error(
-      `OKX swap-instruction fetch failed (timeout=${OKX_FETCH_TIMEOUT_MS}ms): ${reason}`
-    );
-  }
+  // 429 retry mekanizmalı fetch
+  const res = await fetchWithOkx429Retry(fullUrl, headers, "swap-instruction");
 
   if (!res.ok) {
     const bodyText = await res.text().catch(() => "(body okunamadı)");

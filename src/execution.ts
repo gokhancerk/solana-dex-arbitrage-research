@@ -262,7 +262,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(jupLeg, "JUPITER", params.dryRun ?? false));
     console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t2}ms)`);
 
-    console.log("[DEBUG] Leg 2/2 — OKX quote isteniyor...");
+    console.log("[DEBUG] Leg 2/2 — OKX quote isteniyor (rate-throttle aktif)...");
     const t3 = Date.now();
     const { ctx, meta: okxMeta } = await fetchOkxQuote({
       inputMint: solMint,
@@ -300,7 +300,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
     console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t5}ms)`);
   } else {
-    console.log("[DEBUG] Leg 1/2 — OKX quote isteniyor...");
+    console.log("[DEBUG] Leg 1/2 — OKX quote isteniyor (rate-throttle aktif)...");
     const t0 = Date.now();
     const { ctx, meta } = await fetchOkxQuote({
       inputMint: usdcMint,

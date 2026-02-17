@@ -5,6 +5,7 @@ import { buildAndSimulate } from "../execution.js";
 import { Keypair } from "@solana/web3.js";
 import { getKeypairFromEnv } from "../wallet.js";
 import { loadConfig } from "../config.js";
+import { tradeLock } from "../tradeLock.js";
 
 /**
  * Event-driven driver: on each new slot, optionally trigger a quote/sim cycle.
@@ -57,15 +58,29 @@ export class PriceTicker {
       }
       this.lastCheckTime = now;
 
+      // ── Trade Lock: eşzamanlı işlem veya trade cooldown aktifse atla ──
+      const lockResult = tradeLock.tryAcquire();
+      if (!lockResult.acquired) {
+        if (lockResult.skipReason === "EXECUTING") {
+          console.log(`[SKIP] İşlem sürüyor — slot ${slot} atlandı`);
+        } else {
+          console.log(
+            `[SKIP] Cooldown aktif (${lockResult.cooldownRemainingMs}ms kaldı) — slot ${slot} atlandı`
+          );
+        }
+        return;
+      }
+
       const startMs = performance.now();
       try {
-        const result = await buildAndSimulate({ direction: this.direction, notionalUsd: this.notionalUsd, owner: this.owner.publicKey });
+        const result = await buildAndSimulate({ direction: this.direction, notionalUsd: this.notionalUsd, owner: this.owner.publicKey, dryRun: true });
         // Telemetri artık execution.ts içinde yazılıyor (her kod yolunda).
       } catch (e) {
         // Telemetri artık execution.ts içinde throw'dan önce yazılıyor.
         // Burada sadece terminale loglama yapılır.
         console.warn("price ticker sim error", e);
       } finally {
+        tradeLock.release();
         const endMs = performance.now();
         const latencyMs = Math.round(endMs - startMs);
         console.info(`[LATENCY] Slot: ${slot} | E2E Quote & Sim Suresi: ${latencyMs}ms`);

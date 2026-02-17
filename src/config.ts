@@ -32,15 +32,18 @@ export interface AppConfig {
   solUsdcRate: number;
   /** Minimum milliseconds between consecutive API quote requests (throttle) */
   apiCooldownMs: number;
+  /** Minimum milliseconds between consecutive trade executions (cooldown) */
+  tradeCooldownMs: number;
 }
 
 export const DEFAULT_SLIPPAGE_BPS = 20; // 0.2%
 export const DEFAULT_NOTIONAL_CAP = 1000; // USD stable notional
 export const DEFAULT_MAX_RETRIES = 3;
 export const DEFAULT_CIRCUIT_BREAKER = 3;
-export const DEFAULT_MIN_NET_PROFIT_USDC = 0.10; // 10 cents (~0.04% on $240)
+export const DEFAULT_MIN_NET_PROFIT_USDC = 0.05 //0.10; // 10 cents (~0.04% on $240)
 export const DEFAULT_SOL_USDC_RATE = 150; // conservative fallback
 export const DEFAULT_API_COOLDOWN_MS = 2000; // 2 seconds between API calls
+export const DEFAULT_TRADE_COOLDOWN_MS = 4000; // 4 seconds between trades
 
 function requireEnv(name: string, optional = false): string | undefined {
   const v = process.env[name];
@@ -91,6 +94,7 @@ export function loadConfig(): AppConfig {
     minNetProfitUsdc: Number(process.env.MIN_NET_PROFIT_USDC ?? DEFAULT_MIN_NET_PROFIT_USDC),
     solUsdcRate: Number(process.env.SOL_USDC_RATE ?? DEFAULT_SOL_USDC_RATE),
     apiCooldownMs: Number(process.env.API_COOLDOWN_MS ?? DEFAULT_API_COOLDOWN_MS),
+    tradeCooldownMs: Number(process.env.TRADE_COOLDOWN_MS ?? DEFAULT_TRADE_COOLDOWN_MS),
     tokens
   };
 }

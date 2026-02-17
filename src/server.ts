@@ -13,6 +13,7 @@ const DASHBOARD_DIST = path.resolve(process.cwd(), "dashboard", "dist");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 // ─── Auth Middleware ────────────────────────────────────────────────
 // Authorization header'ı ile .env'deki şifreyi karşılaştırır.
@@ -58,6 +59,18 @@ app.get("/api/logs", async (_req, res) => {
     res.json(records);
   } catch (err) {
     console.error("[API] /api/logs hatası:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ─── DELETE /api/logs ────────────────────────────────────────────────
+// trades.jsonl dosyasını temizler.
+app.delete("/api/logs", async (_req, res) => {
+  try {
+    await fs.writeFile(TRADES_FILE, "", "utf-8");
+    res.json({ success: true, message: "Tüm işlem verileri temizlendi." });
+  } catch (err) {
+    console.error("[API] /api/logs DELETE hatası:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

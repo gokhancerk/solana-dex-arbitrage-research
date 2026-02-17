@@ -36,35 +36,44 @@ export async function simulateTx(
     commitment
   });
 
+  type TokenBalanceEntry = {
+    mint: string;
+    owner: string;
+    uiTokenAmount: {
+      amount: string;
+      decimals: number;
+      uiAmount?: number | null;
+      uiAmountString?: string | null;
+    };
+  };
+
   type ExtendedSimValue = SimulatedTransactionResponse & {
+    preBalances?: number[];
     postBalances?: number[];
-    postTokenBalances?: Array<{
-      mint: string;
-      owner: string;
-      uiTokenAmount: {
-        amount: string;
-        decimals: number;
-        uiAmount?: number | null;
-        uiAmountString?: string | null;
-      };
-    }>;
+    preTokenBalances?: TokenBalanceEntry[];
+    postTokenBalances?: TokenBalanceEntry[];
   };
 
   const value = sim.value as ExtendedSimValue;
+
+  const mapTokenBalances = (arr?: TokenBalanceEntry[]) =>
+    arr?.map((b) => ({
+      mint: b.mint,
+      owner: b.owner,
+      rawAmount: b.uiTokenAmount.amount,
+      uiAmount: b.uiTokenAmount.uiAmountString ?? undefined,
+      decimals: b.uiTokenAmount.decimals
+    }));
 
   return {
     logs: value.logs ?? [],
     unitsConsumed: value.unitsConsumed,
     error: value.err ? JSON.stringify(value.err) : undefined,
     accountsLoaded: value.accounts?.length,
+    preBalances: value.preBalances?.map((b: number) => BigInt(b)),
     postBalances: value.postBalances?.map((b: number) => BigInt(b)),
-    postTokenBalances: value.postTokenBalances?.map((b) => ({
-      mint: b.mint,
-      owner: b.owner,
-      rawAmount: b.uiTokenAmount.amount,
-      uiAmount: b.uiTokenAmount.uiAmountString ?? undefined,
-      decimals: b.uiTokenAmount.decimals
-    }))
+    preTokenBalances: mapTokenBalances(value.preTokenBalances),
+    postTokenBalances: mapTokenBalances(value.postTokenBalances)
   };
 }
 

@@ -54,6 +54,83 @@ export interface NetProfitDecision {
   approved: boolean;
 }
 
+/**
+ * Lightweight quote-only profit estimate for a given direction.
+ * Used by PriceTicker to compare both directions before committing
+ * to a full build+simulate cycle.
+ */
+export interface QuoteEstimate {
+  direction: Direction;
+  grossProfitUsdc: number;
+  estimatedFeeUsdc: number;
+  netProfitUsdc: number;
+  /** Whether net profit exceeds the configured minimum threshold */
+  viable: boolean;
+}
+
+/**
+ * Fetch quotes for both legs of a direction and estimate net profit
+ * WITHOUT building transactions or simulating. This is cheap and fast,
+ * suitable for parallel comparison of JUP_TO_OKX vs OKX_TO_JUP.
+ */
+export async function estimateDirectionProfit(params: {
+  direction: Direction;
+  notionalUsd: number;
+  ownerStr: string;
+}): Promise<QuoteEstimate> {
+  const cfg = loadConfig();
+  enforceNotional(params.notionalUsd, cfg.notionalCapUsd);
+
+  const usdcDecimals = cfg.tokens.USDC.decimals;
+  const usdcMint = cfg.tokens.USDC.mint;
+  const solMint = cfg.tokens.SOL.mint;
+  const amountRaw = toRaw(params.notionalUsd, usdcDecimals);
+
+  let finalOutRaw: bigint;
+
+  if (params.direction === "JUP_TO_OKX") {
+    // Leg 1: Jupiter USDC → SOL
+    const { meta: jupMeta } = await fetchJupiterQuote({
+      inputMint: usdcMint, outputMint: solMint,
+      amount: amountRaw, slippageBps: cfg.slippageBps,
+    });
+    // Leg 2: OKX SOL → USDC
+    const { meta: okxMeta } = await fetchOkxQuote({
+      inputMint: solMint, outputMint: usdcMint,
+      amount: jupMeta.expectedOut, slippageBps: cfg.slippageBps,
+      userPublicKey: params.ownerStr,
+    });
+    finalOutRaw = okxMeta.expectedOut;
+  } else {
+    // Leg 1: OKX USDC → SOL
+    const { meta: okxMeta } = await fetchOkxQuote({
+      inputMint: usdcMint, outputMint: solMint,
+      amount: amountRaw, slippageBps: cfg.slippageBps,
+      userPublicKey: params.ownerStr,
+    });
+    // Leg 2: Jupiter SOL → USDC
+    const { meta: jupMeta } = await fetchJupiterQuote({
+      inputMint: solMint, outputMint: usdcMint,
+      amount: okxMeta.expectedOut, slippageBps: cfg.slippageBps,
+    });
+    finalOutRaw = jupMeta.expectedOut;
+  }
+
+  const grossProfitRaw = finalOutRaw - amountRaw;
+  const grossProfitUsdc = Number(grossProfitRaw) / 10 ** usdcDecimals;
+  const feeSol = estimateTxFeeSol(cfg.rpc.priorityFeeMicrolamports, 2);
+  const estFeeUsdc = estimateFeeUsdc(feeSol, cfg.solUsdcRate);
+  const netProfitUsdc = grossProfitUsdc - estFeeUsdc;
+
+  return {
+    direction: params.direction,
+    grossProfitUsdc,
+    estimatedFeeUsdc: estFeeUsdc,
+    netProfitUsdc,
+    viable: netProfitUsdc >= cfg.minNetProfitUsdc,
+  };
+}
+
 interface BuildParams {
   direction: Direction;
   notionalUsd: number; // USDC notionals
@@ -71,15 +148,43 @@ function enforceNotional(notional: number, cap: number) {
   }
 }
 
+/**
+ * Simülasyon sonrasından NET token değişimini (delta) hesaplar.
+ * postBalance - preBalance farkını alarak takastan elde edilen gerçek miktarı döndürür.
+ * Eğer preTokenBalances yoksa (eski RPC), sadece postBalance kullanılır (fallback).
+ */
 function extractSimulatedOut(sim: SimulatedLeg["simulation"], mint?: string, owner?: string): bigint | undefined {
   if (!mint || !owner) return undefined;
-  const balance = sim.postTokenBalances?.find((b) => b.mint === mint && b.owner === owner);
-  if (!balance) return undefined;
-  if (balance.rawAmount) return BigInt(balance.rawAmount);
-  if (balance.uiAmount && typeof balance.decimals === "number") {
-    return BigInt(Math.round(Number(balance.uiAmount) * 10 ** balance.decimals));
-  }
-  return undefined;
+
+  const postEntry = sim.postTokenBalances?.find((b) => b.mint === mint && b.owner === owner);
+  if (!postEntry) return undefined;
+
+  const postRaw = postEntry.rawAmount
+    ? BigInt(postEntry.rawAmount)
+    : postEntry.uiAmount && typeof postEntry.decimals === "number"
+      ? BigInt(Math.round(Number(postEntry.uiAmount) * 10 ** postEntry.decimals))
+      : undefined;
+  if (postRaw === undefined) return undefined;
+
+  // preTokenBalances'tan aynı mint+owner kaydını bul
+  const preEntry = sim.preTokenBalances?.find((b) => b.mint === mint && b.owner === owner);
+  const preRaw = preEntry?.rawAmount
+    ? BigInt(preEntry.rawAmount)
+    : preEntry?.uiAmount && typeof preEntry.decimals === "number"
+      ? BigInt(Math.round(Number(preEntry.uiAmount) * 10 ** preEntry.decimals))
+      : BigInt(0); // Hesap yoksa swap öncesi bakiye 0 kabul edilir
+
+  const delta = postRaw - preRaw;
+
+  // Delta negatifse (input token), 0 döndür — bu çıkış token'ı değil
+  if (delta < BigInt(0)) return undefined;
+
+  console.log(
+    `[DEBUG] extractSimulatedOut mint=${mint.slice(0, 8)}… ` +
+    `pre=${preRaw.toString()} post=${postRaw.toString()} delta=${delta.toString()}`
+  );
+
+  return delta;
 }
 
 async function simulateLeg(leg: SimulatedLeg, venue: "JUPITER" | "OKX") {

@@ -22,7 +22,15 @@ export interface SimulationOutcome {
   unitsConsumed?: number;
   error?: string;
   accountsLoaded?: number;
+  preBalances?: bigint[];
   postBalances?: bigint[];
+  preTokenBalances?: Array<{
+    mint: string;
+    owner: string;
+    rawAmount: string;
+    uiAmount?: string;
+    decimals?: number;
+  }>;
   postTokenBalances?: Array<{
     mint: string;
     owner: string;
@@ -77,6 +85,7 @@ export type TelemetryStatus =
   | "DRY_RUN_PROFITABLE"
   | "REJECTED_LOW_PROFIT"
   | "SLIPPAGE_EXCEEDED"
+  | "SEND_SUCCESS"
   | "SEND_FAILED"
   | "LIMIT_BREACH"
   | "QUOTE_ERROR"

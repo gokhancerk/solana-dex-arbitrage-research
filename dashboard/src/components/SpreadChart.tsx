@@ -4,6 +4,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   XAxis,
   YAxis,
   Tooltip,
@@ -84,7 +85,7 @@ export function SpreadChart({ logs }: SpreadChartProps) {
       </CardHeader>
       <CardContent>
         <ChartContainer config={chartConfig} className="h-[300px] w-full">
-          <BarChart data={data} barGap={2}>
+          <BarChart data={data} barGap={2} barCategoryGap="20%" maxBarSize={28}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} />
             <XAxis
               dataKey="hour"
@@ -97,18 +98,35 @@ export function SpreadChart({ logs }: SpreadChartProps) {
               axisLine={false}
               tickMargin={8}
               tickFormatter={(v: number) => `${v.toFixed(4)}`}
+              domain={["auto", "auto"]}
+              allowDataOverflow={false}
+              scale="linear"
             />
             <Tooltip content={<ChartTooltipContent />} />
             <Bar
               dataKey="grossSpread"
-              fill="var(--color-grossSpread)"
               radius={[4, 4, 0, 0]}
-            />
+              maxBarSize={28}
+            >
+              {data.map((entry, i) => (
+                <Cell
+                  key={`gross-${i}`}
+                  fill={entry.grossSpread > 0 ? "#4caf50" : "var(--color-grossSpread)"}
+                />
+              ))}
+            </Bar>
             <Bar
               dataKey="netSpread"
-              fill="var(--color-netSpread)"
               radius={[4, 4, 0, 0]}
-            />
+              maxBarSize={28}
+            >
+              {data.map((entry, i) => (
+                <Cell
+                  key={`net-${i}`}
+                  fill={entry.netSpread > 0 ? "#4caf50" : "var(--color-netSpread)"}
+                />
+              ))}
+            </Bar>
           </BarChart>
         </ChartContainer>
       </CardContent>

@@ -10,6 +10,7 @@ interface UseTradeLogsResult {
   error: string | null;
   unauthorized: boolean;
   refetch: () => void;
+  clearLogs: () => Promise<boolean>;
 }
 
 export function useTradeLogs(token: string | null, intervalMs = 15000): UseTradeLogsResult {
@@ -64,5 +65,22 @@ export function useTradeLogs(token: string | null, intervalMs = 15000): UseTrade
     return () => clearInterval(id);
   }, [fetchLogs, intervalMs]);
 
-  return { logs, loading, error, unauthorized, refetch: fetchLogs };
+  const clearLogs = useCallback(async (): Promise<boolean> => {
+    if (!token) return false;
+    try {
+      const res = await fetch(`/api/logs`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setLogs([]);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Bilinmeyen hata";
+      setError(`Veriler silinemedi: ${msg}`);
+      return false;
+    }
+  }, [token]);
+
+  return { logs, loading, error, unauthorized, refetch: fetchLogs, clearLogs };
 }

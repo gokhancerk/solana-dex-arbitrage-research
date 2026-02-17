@@ -15,12 +15,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── Auth Middleware ────────────────────────────────────────────────
-// Authorization header'ı ile .env'deki şifreyi karşılaştırır.
-app.use("/api", (req, res, next) => {
+// ─── API Router (Express 5 uyumlu) ─────────────────────────────────
+const apiRouter = express.Router();
+
+// Auth middleware — Router seviyesinde uygulanır
+apiRouter.use((req, res, next) => {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (!DASHBOARD_PASSWORD) {
-    // Şifre tanımlı değilse korumayı devre dışı bırak
     return next();
   }
   if (token === DASHBOARD_PASSWORD) {
@@ -29,15 +30,13 @@ app.use("/api", (req, res, next) => {
   res.status(401).json({ error: "Unauthorized" });
 });
 
-// ─── GET /api/logs ──────────────────────────────────────────────────
-// logs/trades.jsonl dosyasını okuyup her satırı parse eder, JSON dizisi döndürür.
-app.get("/api/logs", async (_req, res) => {
+// GET /api/logs — trades.jsonl dosyasını okuyup JSON dizisi döndürür
+apiRouter.get("/logs", async (_req, res) => {
   try {
     let content: string;
     try {
       content = await fs.readFile(TRADES_FILE, "utf-8");
     } catch {
-      // Dosya yoksa boş dizi döndür
       res.json([]);
       return;
     }
@@ -63,9 +62,8 @@ app.get("/api/logs", async (_req, res) => {
   }
 });
 
-// ─── DELETE /api/logs ────────────────────────────────────────────────
-// trades.jsonl dosyasını temizler.
-app.delete("/api/logs", async (_req, res) => {
+// DELETE /api/logs — trades.jsonl dosyasını temizler
+apiRouter.delete("/logs", async (_req, res) => {
   try {
     await fs.writeFile(TRADES_FILE, "", "utf-8");
     res.json({ success: true, message: "Tüm işlem verileri temizlendi." });
@@ -74,6 +72,9 @@ app.delete("/api/logs", async (_req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Router'ı /api prefix'ine mount et
+app.use("/api", apiRouter);
 
 // ─── React Dashboard Static Files ───────────────────────────────────
 app.use(express.static(DASHBOARD_DIST));

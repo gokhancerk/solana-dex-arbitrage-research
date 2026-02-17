@@ -68,8 +68,8 @@ export function useTradeLogs(token: string | null, intervalMs = 15000): UseTrade
   const clearLogs = useCallback(async (): Promise<boolean> => {
     if (!token) return false;
     try {
-      const res = await fetch(`/api/logs`, {
-        method: "DELETE",
+      const res = await fetch(`/api/logs/clear`, {
+        method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

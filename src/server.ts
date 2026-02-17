@@ -62,13 +62,15 @@ apiRouter.get("/logs", async (_req, res) => {
   }
 });
 
-// DELETE /api/logs — trades.jsonl dosyasını temizler
-apiRouter.delete("/logs", async (_req, res) => {
+// POST /api/logs/clear — trades.jsonl dosyasını temizler
+// Not: Express 5 + path-to-regexp v8'de DELETE method route eşleşme sorunu
+// nedeniyle POST kullanılıyor.
+apiRouter.post("/logs/clear", async (_req, res) => {
   try {
     await fs.writeFile(TRADES_FILE, "", "utf-8");
     res.json({ success: true, message: "Tüm işlem verileri temizlendi." });
   } catch (err) {
-    console.error("[API] /api/logs DELETE hatası:", err);
+    console.error("[API] /api/logs/clear hatası:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

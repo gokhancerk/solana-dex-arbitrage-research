@@ -1,11 +1,25 @@
+import { useAuth } from "@/hooks/useAuth";
 import { useTradeLogs } from "@/hooks/useTradeLogs";
+import { LoginScreen } from "@/components/LoginScreen";
 import { StatsCards } from "@/components/StatsCards";
 import { SpreadChart } from "@/components/SpreadChart";
 import { TradesTable } from "@/components/TradesTable";
-import { RefreshCw, AlertCircle } from "lucide-react";
+import { RefreshCw, AlertCircle, LogOut } from "lucide-react";
 
 function App() {
-  const { logs, loading, error, refetch } = useTradeLogs();
+  const { token, login, logout, loginError, loading: authLoading } = useAuth();
+  const { logs, loading, error, unauthorized, refetch } = useTradeLogs(token);
+
+  // Token var ama API 401 dönüyorsa → geçersiz şifre, logout yap
+  if (unauthorized || !token) {
+    return (
+      <LoginScreen
+        onLogin={login}
+        error={loginError}
+        loading={authLoading}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -20,14 +34,23 @@ function App() {
               SOL/USDC Arbitraj Bot Metrikleri
             </p>
           </div>
-          <button
-            onClick={refetch}
-            disabled={loading}
-            className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium hover:bg-accent transition-colors disabled:opacity-50"
-          >
-            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-            Yenile
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={refetch}
+              disabled={loading}
+              className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium hover:bg-accent transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+              Yenile
+            </button>
+            <button
+              onClick={logout}
+              className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium hover:bg-destructive/10 hover:text-destructive transition-colors"
+              title="Çıkış Yap"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       </header>
 

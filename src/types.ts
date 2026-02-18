@@ -58,6 +58,31 @@ export interface NetProfitInfo {
   netProfitUsdc: number;
 }
 
+/**
+ * On-chain gerçek bakiye deltasına dayalı kâr/zarar bilgisi.
+ * Pre-trade vs Post-trade bakiye farkından hesaplanır.
+ */
+export interface RealizedPnlInfo {
+  /** Post_USDC - Pre_USDC (pozitif = kazanç) */
+  deltaUsdc: number;
+  /** Pre_SOL - Post_SOL (harcanan gas/fee, SOL cinsinden) */
+  deltaSol: number;
+  /** SOL maliyetinin USDC karşılığı */
+  solCostUsdc: number;
+  /** Net gerçek kâr: deltaUsdc - solCostUsdc */
+  realizedNetProfitUsdc: number;
+  /** Hesapta kullanılan SOL/USDC kuru */
+  solUsdcRate: number;
+  /** Pre-trade USDC bakiyesi (raw) */
+  preUsdcRaw: string;
+  /** Post-trade USDC bakiyesi (raw) */
+  postUsdcRaw: string;
+  /** Pre-trade SOL bakiyesi (lamports) */
+  preSolLamports: string;
+  /** Post-trade SOL bakiyesi (lamports) */
+  postSolLamports: string;
+}
+
 export interface BuildSimulateResult {
   direction: Direction;
   legs: SimulatedLeg[];
@@ -90,7 +115,10 @@ export type TelemetryStatus =
   | "SEND_FAILED"
   | "LIMIT_BREACH"
   | "QUOTE_ERROR"
-  | "UNKNOWN_ERROR";
+  | "UNKNOWN_ERROR"
+  | "EMERGENCY_UNWIND_SUCCESS"
+  | "EMERGENCY_UNWIND_FAILED"
+  | "LEG2_REFRESH_FAILED";
 
 export interface Telemetry {
   pair: TradePair;
@@ -105,14 +133,17 @@ export interface Telemetry {
   timestamp: string;
   retries: number;
   profitLabel: "profit" | "loss" | "flat";
-  /** Net profit/loss in USDC after estimated fees */
+  /** Net profit/loss in USDC after estimated fees (TAHMİNİ — quote-based) */
   netProfitUsdc: number;
-  /** Gross profit in USDC before fees */
+  /** Gross profit in USDC before fees (TAHMİNİ) */
   grossProfitUsdc: number;
-  /** Estimated network fee in USDC */
+  /** Estimated network fee in USDC (TAHMİNİ) */
   feeUsdc: number;
   /** Machine-readable status tag */
   status: TelemetryStatus;
+  // ───── Realized PnL (gerçek bakiye deltası) ─────
+  /** Gerçek on-chain bakiye farkına dayalı kâr/zarar. Sadece SEND_SUCCESS ve EMERGENCY_UNWIND_* durumlarında dolu. */
+  realizedPnl?: RealizedPnlInfo;
 }
 
 export class LimitBreachError extends Error {}

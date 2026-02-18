@@ -1,6 +1,6 @@
 import { promises as fs } from "fs";
 import path from "path";
-import { BuildSimulateResult, Telemetry, TelemetryStatus, Direction, NetProfitInfo } from "./types.js";
+import { BuildSimulateResult, Telemetry, TelemetryStatus, Direction, NetProfitInfo, RealizedPnlInfo } from "./types.js";
 import type { TradePair, TokenSymbol } from "./config.js";
 
 // ───── Logs directory & file path ─────
@@ -33,6 +33,8 @@ export interface BuildTelemetryParams {
   failReason?: string;
   status: TelemetryStatus;
   netProfit?: NetProfitInfo;
+  /** On-chain gerçek bakiye deltasına dayalı kâr/zarar (Pre vs Post snapshot) */
+  realizedPnl?: RealizedPnlInfo;
 }
 
 export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
@@ -46,6 +48,7 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
     failReason,
     status,
     netProfit,
+    realizedPnl,
   } = params;
 
   const pair: TradePair = `${targetToken}/USDC` as TradePair;
@@ -59,7 +62,11 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
   const simulatedStr = simulatedOut.toString();
 
   let profitLabel: Telemetry["profitLabel"] = "flat";
-  if (realizedOut && realizedOut > expectedOut) profitLabel = "profit";
+  // Öncelik: Realized PnL varsa gerçek sonuç kullanılır (tahmini değil)
+  if (realizedPnl) {
+    if (realizedPnl.realizedNetProfitUsdc > 0.0001) profitLabel = "profit";
+    else if (realizedPnl.realizedNetProfitUsdc < -0.0001) profitLabel = "loss";
+  } else if (realizedOut && realizedOut > expectedOut) profitLabel = "profit";
   else if (realizedOut && realizedOut < expectedOut) profitLabel = "loss";
   else if (netProfit) {
     if (netProfit.netProfitUsdc > 0) profitLabel = "profit";
@@ -79,10 +86,12 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
     timestamp: new Date().toISOString(),
     retries: sendSignatures.length > 0 ? sendSignatures.length - 1 : 0,
     profitLabel,
-    netProfitUsdc: netProfit?.netProfitUsdc ?? 0,
-    grossProfitUsdc: netProfit?.grossProfitUsdc ?? 0,
-    feeUsdc: netProfit?.feeUsdc ?? 0,
+    // Realized PnL varsa gerçek değerleri yaz, yoksa tahmini değerleri koru
+    netProfitUsdc: realizedPnl?.realizedNetProfitUsdc ?? netProfit?.netProfitUsdc ?? 0,
+    grossProfitUsdc: realizedPnl?.deltaUsdc ?? netProfit?.grossProfitUsdc ?? 0,
+    feeUsdc: realizedPnl?.solCostUsdc ?? netProfit?.feeUsdc ?? 0,
     status,
+    realizedPnl,
   };
 }
 
@@ -99,6 +108,9 @@ const PERSISTABLE_STATUSES: ReadonlySet<TelemetryStatus> = new Set([
   "DRY_RUN_PROFITABLE",
   "REJECTED_LOW_PROFIT",
   "SEND_SUCCESS",
+  "EMERGENCY_UNWIND_SUCCESS",
+  "EMERGENCY_UNWIND_FAILED",
+  "LEG2_REFRESH_FAILED",
 ]);
 
 /**

@@ -12,6 +12,18 @@ export interface TradeLog {
   grossProfitUsdc: number;
   feeUsdc: number;
   status: string;
+  /** On-chain gerçek bakiye deltasına dayalı kâr/zarar (varsa) */
+  realizedPnl?: {
+    deltaUsdc: number;
+    deltaSol: number;
+    solCostUsdc: number;
+    realizedNetProfitUsdc: number;
+    solUsdcRate: number;
+    preUsdcRaw: string;
+    postUsdcRaw: string;
+    preSolLamports: string;
+    postSolLamports: string;
+  };
 }
 
 export interface HourlyBucket {

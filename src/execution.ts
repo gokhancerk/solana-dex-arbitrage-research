@@ -1,8 +1,10 @@
 import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
-import { getConnection, sendVersionedWithOpts, resolveSolBalance } from "./solana.js";
+import bs58 from "bs58";
+import { getConnection, sendVersionedWithOpts, resolveSolBalance, deriveATA } from "./solana.js";
 import { loadConfig, type TokenSymbol, type TradePair } from "./config.js";
 import { toRaw } from "./tokens.js";
 import { suggestPriorityFee } from "./fees.js";
+import { takeBalanceSnapshot } from "./balanceSnapshot.js";
 import {
   Direction,
   BuildSimulateResult,
@@ -21,6 +23,15 @@ import {
 import { fetchJupiterQuote, buildJupiterSwap, computeSlippageBps, simulateJupiterTx, type JupiterRouteInfo } from "./jupiter.js";
 import { fetchOkxQuote, buildOkxSwap, simulateOkxTx } from "./okxDex.js";
 import { buildTelemetry, appendTradeLog } from "./telemetry.js";
+import {
+  prepareAtomicBundle,
+  sendJitoBundle,
+  waitForBundleLanding,
+  checkBundleTxResults,
+  JitoBundleError,
+  type JitoBundleResult,
+  type AtomicBundleData,
+} from "./jito.js";
 
 let consecutiveFailedSends = 0;
 
@@ -299,23 +310,45 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
   // Dinamik fee — swap TX'lere iletilecek
   const dynFee = await resolvePriorityFee();
 
+  // ── CACHED ESTIMATE KONTROLÜ ──
+  // estimateDirectionProfit'ten gelen cache'li Jupiter route + OKX meta varsa
+  // AYNI fiyatları kullanarak TX oluştur — re-quote YAPMA.
+  // Bu, tahmini kâr ile gönderim kârının AYNI olmasını garanti eder.
+  const cached = params.cachedEstimate;
+  const hasJupCache = !!(cached?._cachedJupRoute && cached?._cachedJupMeta);
+  const hasOkxCache = !!(cached?._cachedOkxMeta);
+
+  if (hasJupCache) {
+    console.log(`[CACHE-HIT] Jupiter route cache'den kullanılacak — re-quote atlanıyor (stale fiyat riski önlendi)`);
+  }
+
   if (params.direction === "JUP_TO_OKX") {
-    // ── Leg 1: Jupiter USDC → targetToken (█ HER ZAMAN TAZE QUOTE █) ──
-    // Stale quote → stale otherAmountThreshold → Custom:1 sim hatasını önler
-    console.log(`[FRESH] Leg 1/2 — Jupiter TAZE quote isteniyor (USDC→${targetToken})...`);
-    const t0 = Date.now();
-    const { route, meta } = await fetchJupiterQuote({
-      inputMint: usdcMint,
-      outputMint: targetMint,
-      amount: amountRaw,
-      slippageBps: cfg.slippageBps
-    });
-    console.log(`[FRESH] Jupiter quote alındı (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
-    quoteMeta.push(meta);
+    // ── Leg 1: Jupiter USDC → targetToken ──
+    let jupRoute: JupiterRouteInfo;
+    let jupMeta: QuoteMeta;
+
+    if (hasJupCache) {
+      // ★ CACHE: estimateDirectionProfit'ten gelen aynı route'u kullan
+      jupRoute = cached!._cachedJupRoute!;
+      jupMeta = cached!._cachedJupMeta!;
+      console.log(`[CACHE] Leg 1/2 — Cached Jupiter route (expectedOut=${jupMeta.expectedOut.toString()})`);
+    } else {
+      // Fresh quote (cache yoksa)
+      console.log(`[FRESH] Leg 1/2 — Jupiter TAZE quote isteniyor (USDC→${targetToken})...`);
+      const t0 = Date.now();
+      const result = await fetchJupiterQuote({
+        inputMint: usdcMint, outputMint: targetMint,
+        amount: amountRaw, slippageBps: cfg.slippageBps
+      });
+      jupRoute = result.route;
+      jupMeta = result.meta;
+      console.log(`[FRESH] Jupiter quote alındı (${Date.now() - t0}ms) — expectedOut=${jupMeta.expectedOut.toString()}`);
+    }
+    quoteMeta.push(jupMeta);
 
     console.log("[DEBUG] Jupiter swap TX oluşturuluyor...");
     const t1 = Date.now();
-    const jupTx = await buildJupiterSwap({ route, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
+    const jupTx = await buildJupiterSwap({ route: jupRoute, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
     console.log(`[DEBUG] Jupiter swap TX hazır (${Date.now() - t1}ms)`);
 
     const jupLeg: SimulatedLeg = {
@@ -323,23 +356,31 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       tx: jupTx,
       outMint: targetMint,
       owner: ownerStr,
-      expectedOut: meta.expectedOut,
-      simulatedOut: meta.expectedOut,
+      expectedOut: jupMeta.expectedOut,
+      simulatedOut: jupMeta.expectedOut,
       simulation: { logs: [] }
     };
 
-    console.log("[DEBUG] Jupiter TX simüle ediliyor...");
-    const t2 = Date.now();
-    legs.push(await simulateLegSafe(jupLeg, "JUPITER", params.dryRun ?? false));
-    console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t2}ms)`);
+    // ★ Leg 1 simülasyonu ATLANIR (live mode) — hız optimizasyonu.
+    // On-chain slippage koruması (otherAmountThreshold) zaten aktif.
+    // Sadece dryRun modunda simüle et.
+    if (params.dryRun) {
+      console.log("[DEBUG] Jupiter TX simüle ediliyor (dry-run)...");
+      const t2 = Date.now();
+      legs.push(await simulateLegSafe(jupLeg, "JUPITER", true));
+      console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t2}ms)`);
+    } else {
+      console.log(`[SKIP-SIM] Leg 1/2 (JUPITER) simülasyon atlandı — hız optimizasyonu, otherAmountThreshold aktif`);
+      legs.push(jupLeg);
+    }
 
-    // ── Leg 2: OKX targetToken → USDC (swap-instruction'dan meta alır — ayrı quote gereksiz) ──
+    // ── Leg 2: OKX targetToken → USDC ──
     console.log(`[DEBUG] Leg 2/2 — OKX swap-instruction isteniyor (${targetToken}→USDC)...`);
     const t4 = Date.now();
     const { tx: okxTx, meta: okxMeta } = await buildOkxSwap({
       inputMint: targetMint,
       outputMint: usdcMint,
-      amount: meta.expectedOut,
+      amount: jupMeta.expectedOut,
       slippageBps: cfg.slippageBps,
       userPublicKey: ownerStr,
       priorityFeeMicroLamports: dynFee,
@@ -357,15 +398,11 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       simulation: { logs: [] }
     };
 
-    // Leg 2 simülasyonu ATLANIR: Cüzdan henüz Leg 1'i göndermediği için
-    // targetToken bakiyesi yok → simülasyon her zaman Custom:1 fırlatır.
-    // On-chain slippage koruması (otherAmountThreshold) zaten aktif.
     console.log(`[SKIP-SIM] Leg 2/2 (${okxLeg.venue}) simülasyon atlandı — Leg 1 henüz zincirde değil, quote'a güveniliyor`);
     legs.push(okxLeg);
   } else {
-    // ── Leg 1: OKX USDC → targetToken (swap-instruction'dan meta alır) ──
-    // Cache'deki OKX miktarını kullanarak swap-instruction çağrırız.
-    // swap-instruction response'u zaten taze routing + meta içerir.
+    // ── Leg 1: OKX USDC → targetToken ──
+    // OKX buildOkxSwap her zaman çağrılmalı (TX gerekli).
     console.log(`[DEBUG] Leg 1/2 — OKX swap-instruction isteniyor (USDC→${targetToken})...`);
     const t0 = Date.now();
     const { tx: okxTx, meta } = await buildOkxSwap({
@@ -389,27 +426,57 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       simulation: { logs: [] }
     };
 
-    console.log("[DEBUG] OKX TX simüle ediliyor...");
-    const t2 = Date.now();
-    legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
-    console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t2}ms)`);
+    // ★ Leg 1 simülasyonu ATLANIR (live mode)
+    if (params.dryRun) {
+      console.log("[DEBUG] OKX TX simüle ediliyor (dry-run)...");
+      const t2 = Date.now();
+      legs.push(await simulateLegSafe(okxLeg, "OKX", true));
+      console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t2}ms)`);
+    } else {
+      console.log(`[SKIP-SIM] Leg 1/2 (OKX) simülasyon atlandı — hız optimizasyonu, otherAmountThreshold aktif`);
+      legs.push(okxLeg);
+    }
 
-    // ── Leg 2: Jupiter targetToken → USDC (█ HER ZAMAN TAZE QUOTE █) ──
-    // Stale quote → stale otherAmountThreshold → Custom:1 sim hatasını önler
-    console.log(`[FRESH] Leg 2/2 — Jupiter TAZE quote isteniyor (${targetToken}→USDC)...`);
-    const t3 = Date.now();
-    const { route, meta: jupMeta } = await fetchJupiterQuote({
-      inputMint: targetMint,
-      outputMint: usdcMint,
-      amount: meta.expectedOut,
-      slippageBps: cfg.slippageBps
-    });
-    console.log(`[FRESH] Jupiter quote alındı (${Date.now() - t3}ms) — expectedOut=${jupMeta.expectedOut.toString()}`);
+    // ── Leg 2: Jupiter targetToken → USDC ──
+    let jupRoute: JupiterRouteInfo;
+    let jupMeta: QuoteMeta;
+
+    // Cache kontrolü: OKX output cache'deki ile uyuşuyor mu?
+    // Eğer OKX'ten gelen expectedOut, cache'deki ile %2'den az farklıysa
+    // cache'li Jupiter route'u kullan — re-quote YAPMA.
+    const okxOutDeviation = hasOkxCache
+      ? Math.abs(Number(meta.expectedOut - cached!._cachedOkxMeta!.expectedOut)) / Number(cached!._cachedOkxMeta!.expectedOut)
+      : Infinity;
+    const canReuseJupCache = hasJupCache && okxOutDeviation < 0.02;
+
+    if (canReuseJupCache) {
+      jupRoute = cached!._cachedJupRoute!;
+      jupMeta = cached!._cachedJupMeta!;
+      console.log(
+        `[CACHE] Leg 2/2 — Cached Jupiter route (OKX sapma: ${(okxOutDeviation * 100).toFixed(2)}% < 2%) — ` +
+        `expectedOut=${jupMeta.expectedOut.toString()}`
+      );
+    } else {
+      console.log(`[FRESH] Leg 2/2 — Jupiter TAZE quote isteniyor (${targetToken}→USDC)...`);
+      if (hasOkxCache) {
+        console.log(`[FRESH] OKX sapma: ${(okxOutDeviation * 100).toFixed(2)}% > 2% — cache geçersiz`);
+      }
+      const t3 = Date.now();
+      const result = await fetchJupiterQuote({
+        inputMint: targetMint,
+        outputMint: usdcMint,
+        amount: meta.expectedOut,
+        slippageBps: cfg.slippageBps
+      });
+      jupRoute = result.route;
+      jupMeta = result.meta;
+      console.log(`[FRESH] Jupiter quote alındı (${Date.now() - t3}ms) — expectedOut=${jupMeta.expectedOut.toString()}`);
+    }
     quoteMeta.push(jupMeta);
 
     console.log("[DEBUG] Jupiter swap TX oluşturuluyor...");
     const t4 = Date.now();
-    const jupTx = await buildJupiterSwap({ route, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
+    const jupTx = await buildJupiterSwap({ route: jupRoute, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
     console.log(`[DEBUG] Jupiter swap TX hazır (${Date.now() - t4}ms)`);
 
     const jupLeg: SimulatedLeg = {
@@ -422,9 +489,6 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       simulation: { logs: [] }
     };
 
-    // Leg 2 simülasyonu ATLANIR: Cüzdan henüz Leg 1'i göndermediği için
-    // targetToken bakiyesi yok → simülasyon her zaman Custom:1 fırlatır.
-    // On-chain slippage koruması (otherAmountThreshold) zaten aktif.
     console.log(`[SKIP-SIM] Leg 2/2 (${jupLeg.venue}) simülasyon atlandı — Leg 1 henüz zincirde değil, quote'a güveniliyor`);
     legs.push(jupLeg);
   }
@@ -506,6 +570,54 @@ function backoffForAttempt(attempt: number): number {
   return base * 2 ** (attempt - 1);
 }
 
+/**
+ * Signed TX'ten base58 signature string'i çıkarır.
+ * sendTransaction() başarısız olsa bile imzayı biliyoruz — zincirde kontrol edebiliriz.
+ */
+function extractSignatureFromTx(tx: VersionedTransaction): string | undefined {
+  try {
+    const sigBytes = tx.signatures[0];
+    if (!sigBytes || sigBytes.every(b => b === 0)) return undefined;
+    return bs58.encode(sigBytes);
+  } catch { return undefined; }
+}
+
+/**
+ * TX'in zincirde gerçekten confirm olup olmadığını kontrol eder.
+ * RPC error dönse bile TX zincirde başarılı olmuş olabilir (timeout, ağ hatası).
+ * Bu fonksiyon emergency unwind'den önce MUTLAKA çağrılmalıdır.
+ */
+async function verifyTxOnChain(
+  signature: string,
+  timeoutMs: number = 8_000
+): Promise<{ confirmed: boolean; err?: string }> {
+  try {
+    const connection = getConnection();
+    const t0 = Date.now();
+    // Kısa bir bekleme — TX propagation süresi
+    await new Promise(r => setTimeout(r, 2_000));
+
+    while (Date.now() - t0 < timeoutMs) {
+      const resp = await connection.getSignatureStatuses([signature]);
+      const status = resp.value?.[0];
+      if (status) {
+        const level = status.confirmationStatus;
+        if (level === "confirmed" || level === "finalized") {
+          if (status.err) {
+            return { confirmed: true, err: JSON.stringify(status.err) };
+          }
+          return { confirmed: true };
+        }
+        // "processed" — henüz confirm değil, biraz daha bekle
+      }
+      await new Promise(r => setTimeout(r, 1_500));
+    }
+    return { confirmed: false };
+  } catch {
+    return { confirmed: false };
+  }
+}
+
 export async function sendWithRetry(
   tx: VersionedTransaction,
   signer: Keypair,
@@ -528,16 +640,56 @@ export async function sendWithRetry(
       attempts.push({ signature, attempt, backoffMs: 0, timestamp: new Date().toISOString() });
       return { success: true, finalSignature: signature, attempts };
     } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
       consecutiveFailedSends += 1;
+
+      // ── On-chain doğrulama: RPC error dönse bile TX zincirde olabilir ──
+      const knownSig = extractSignatureFromTx(tx);
+      if (knownSig) {
+        console.log(
+          `[SEND-VERIFY] RPC error sonrası TX zincirde kontrol ediliyor: ${knownSig.slice(0, 16)}…`
+        );
+        const check = await verifyTxOnChain(knownSig, 6_000);
+        if (check.confirmed && !check.err) {
+          console.log(
+            `[SEND-VERIFY] ✓ TX zincirde BAŞARILI CONFIRM! sig=${knownSig.slice(0, 16)}… — RPC error yanlış alarm.`
+          );
+          consecutiveFailedSends = Math.max(0, consecutiveFailedSends - 1);
+          attempts.push({ signature: knownSig, attempt, backoffMs: 0, timestamp: new Date().toISOString() });
+          return { success: true, finalSignature: knownSig, attempts };
+        }
+        if (check.confirmed && check.err) {
+          console.warn(
+            `[SEND-VERIFY] TX zincirde confirm AMA on-chain hata: ${check.err}`
+          );
+          // TX on-chain error ile confirm oldu — artık retry etmenin anlamı yok
+          break;
+        }
+        console.log(`[SEND-VERIFY] TX henüz zincirde bulunamadı — retry devam ediyor`);
+      }
+
       const backoffMs = backoffForAttempt(attempt);
       attempts.push({
-        signature: undefined,
-        error: err instanceof Error ? err.message : String(err),
+        signature: knownSig,
+        error: errorMsg,
         attempt,
         backoffMs,
         timestamp: new Date().toISOString()
       });
       if (attempt === cfg.maxRetries) {
+        // ── Son deneme sonrası bir kez daha on-chain kontrol ──
+        if (knownSig) {
+          console.log(`[SEND-VERIFY] Son retry de başarısız — son bir on-chain kontrol yapılıyor…`);
+          const finalCheck = await verifyTxOnChain(knownSig, 10_000);
+          if (finalCheck.confirmed && !finalCheck.err) {
+            console.log(
+              `[SEND-VERIFY] ✓ TX son kontrolde zincirde bulundu! sig=${knownSig.slice(0, 16)}…`
+            );
+            consecutiveFailedSends = Math.max(0, consecutiveFailedSends - 1);
+            attempts.push({ signature: knownSig, attempt: attempt + 1, backoffMs: 0, timestamp: new Date().toISOString() });
+            return { success: true, finalSignature: knownSig, attempts };
+          }
+        }
         const failReason = `Send failed after ${cfg.maxRetries} attempts`;
         if (consecutiveFailedSends >= cfg.circuitBreakerThreshold) {
           throw new SendError(`${failReason}; circuit breaker tripped`);
@@ -663,6 +815,8 @@ export interface EmergencyUnwindParams {
   direction: Direction;
   /** Leg 1 signature for telemetry cross-reference */
   leg1Signature?: string;
+  /** Gerçek trade miktarı (USDC) — loss hesabı için notionalCapUsd yerine kullanılır */
+  actualTradeAmountUsdc?: number;
 }
 
 export interface EmergencyUnwindResult {
@@ -677,16 +831,84 @@ export interface EmergencyUnwindResult {
   failReason?: string;
   /** Number of attempts made */
   attempts: number;
+  /** True if we detected Leg 2 already succeeded (no unwind needed) */
+  leg2AlreadySucceeded?: boolean;
 }
 
 /** Emergency unwind uses Jupiter (most liquid, most reliable) to dump token → USDC */
 const UNWIND_MAX_RETRIES = 5;
 /** Emergency slippage: 1% — accept small loss to recover capital */
 const UNWIND_SLIPPAGE_BPS = 100;
+/** Token balance'ın beklenenin %5'inden azsa Leg 2 muhtemelen başarılı olmuştur */
+const LEG2_SUCCESS_THRESHOLD_PCT = 5;
+
+/**
+ * Leg 2'nin zincirde başarılı olup olmadığını kontrol eder.
+ * Token balance beklenenin çok altındaysa (<%5), Leg 2 muhtemelen çoktan çalışmıştır.
+ * Bu durumda USDC bakiyesini kontrol ederek doğrulama yapar.
+ */
+async function checkLeg2AlreadySucceeded(
+  owner: PublicKey,
+  targetToken: TokenSymbol,
+  expectedTokenRaw: bigint,
+  preTradeUsdcRaw?: bigint,
+): Promise<{ likely: boolean; currentTokenBalance: bigint; currentUsdcRaw: bigint }> {
+  const cfg = loadConfig();
+  const connection = getConnection();
+  const targetMint = cfg.tokens[targetToken].mint;
+  const usdcMint = new PublicKey(cfg.tokens.USDC.mint);
+  const usdcAta = deriveATA(owner, usdcMint);
+  const isNativeSol = targetToken === "SOL";
+
+  let tokenBalance = BigInt(0);
+  if (isNativeSol) {
+    // SOL: ATA + native kontrol
+    const wsolMint = new PublicKey(targetMint);
+    const solInfo = await resolveSolBalance(owner, wsolMint, expectedTokenRaw);
+    tokenBalance = solInfo.swapAmount;
+  } else {
+    // SPL token ATA bakiyesi
+    const ata = deriveATA(owner, new PublicKey(targetMint));
+    const info = await connection.getTokenAccountBalance(ata).catch(() => null);
+    tokenBalance = info ? BigInt(info.value.amount) : BigInt(0);
+  }
+
+  // USDC bakiyesini oku
+  const usdcInfo = await connection.getTokenAccountBalance(usdcAta).catch(() => null);
+  const currentUsdcRaw = usdcInfo ? BigInt(usdcInfo.value.amount) : BigInt(0);
+
+  // Token balance beklenenin %5'inden az mı?
+  const threshold = (expectedTokenRaw * BigInt(LEG2_SUCCESS_THRESHOLD_PCT)) / BigInt(100);
+  const tokenAlmostGone = tokenBalance < threshold;
+
+  // USDC artış kontrolü (eğer pre-trade USDC bilgisi varsa)
+  let usdcIncreased = false;
+  if (preTradeUsdcRaw !== undefined) {
+    // Leg 2 ~500 USDC geri getirmeli, minimum %80'ini aramak
+    const usdcDelta = currentUsdcRaw - preTradeUsdcRaw;
+    const usdcDecimals = cfg.tokens.USDC.decimals;
+    const expectedUsdcReturn = BigInt(Math.round(200 * 10 ** usdcDecimals)); // minimum 200 USDC dönüşü bekle
+    usdcIncreased = usdcDelta > expectedUsdcReturn;
+  }
+
+  const likely = tokenAlmostGone && (usdcIncreased || preTradeUsdcRaw === undefined);
+
+  console.log(
+    `[LEG2-CHECK] Token balance: ${tokenBalance.toString()} / expected: ${expectedTokenRaw.toString()} ` +
+    `(${((Number(tokenBalance) / Number(expectedTokenRaw)) * 100).toFixed(1)}%) | ` +
+    `USDC: ${currentUsdcRaw.toString()} | ` +
+    `Leg2 zaten başarılı mı? ${likely ? "EVET ✓" : "HAYIR — unwind gerekli"}`
+  );
+
+  return { likely, currentTokenBalance: tokenBalance, currentUsdcRaw };
+}
 
 /**
  * Acil sermaye kurtarma: Leg 2 başarısız olduğunda cüzdandaki
  * takılı token'ı Jupiter üzerinden USDC'ye çevirir.
+ *
+ * ÖNCELİKLİ KONTROL: Token bakiyesi beklenenin %5'inden azsa ve
+ * USDC bakiyesi artmışsa → Leg 2 zaten başarılı olmuştur, unwind ATLANIR.
  *
  * - Jupiter kullanır (en likit, en güvenilir)
  * - Daha yüksek slippage (1%) kabul eder — amaç sermaye kurtarma, kâr değil
@@ -712,6 +934,48 @@ export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<Em
     `  Max Retry: ${UNWIND_MAX_RETRIES}, Slippage: ${UNWIND_SLIPPAGE_BPS} BPS (${UNWIND_SLIPPAGE_BPS / 100}%)\n`
   );
 
+  // ── PRE-CHECK: Leg 2 zaten başarılı mı? ──
+  // RPC error dönse bile TX zincirde çalışmış olabilir.
+  // Token bakiyesi neredeyse 0 ise → Leg 2 muhtemelen başarı ile tamamlanmıştır.
+  console.log(`[EMERGENCY-UNWIND] On-chain pre-check: Leg 2 zaten çalışmış olabilir mi?`);
+  // Kısa bir bekleme — Leg 2 TX'inin zincire yerleşmesi için
+  await new Promise(r => setTimeout(r, 3_000));
+  const leg2Check = await checkLeg2AlreadySucceeded(
+    params.signer.publicKey,
+    params.targetToken,
+    params.stuckAmountRaw,
+  );
+
+  if (leg2Check.likely) {
+    console.warn(
+      `[EMERGENCY-UNWIND] ★ Leg 2 ZATEN BAŞARILI OLMUŞ! Token balance neredeyse 0 ` +
+      `(${leg2Check.currentTokenBalance.toString()}). ` +
+      `USDC bakiye: ${leg2Check.currentUsdcRaw.toString()} raw. ` +
+      `Emergency unwind GEREKSİZ — atlanıyor.`
+    );
+
+    // Circuit breaker reset — aslında her şey OK
+    resetCircuitBreaker();
+
+    const tel = buildTelemetry({
+      direction: params.direction,
+      targetToken: params.targetToken,
+      sendSignatures: [params.leg1Signature ?? ""],
+      success: true,
+      status: "EMERGENCY_UNWIND_SUCCESS",
+      failReason: "Leg 2 already succeeded on-chain — unwind skipped (false alarm)",
+      netProfit: { grossProfitUsdc: 0, feeUsdc: 0, netProfitUsdc: 0 },
+    });
+    appendTradeLog(tel);
+
+    return {
+      success: true,
+      failReason: "Leg 2 already succeeded — no unwind needed",
+      attempts: 0,
+      leg2AlreadySucceeded: true,
+    };
+  }
+
   // SOL ise on-chain bakiyeyi kontrol et — OKX unwrap etmiş olabilir
   const isNativeSol = params.targetToken === "SOL";
   let unwindAmount = params.stuckAmountRaw;
@@ -731,11 +995,55 @@ export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<Em
       `nativeUsable=${solInfo.usableNativeLamports.toString()}, ` +
       `swapAmount=${unwindAmount.toString()}, wrapAndUnwrapSol=${wrapAndUnwrapSol}`
     );
+
+    // ── UYARI: Çok düşük swap miktarı kontrolü ──
+    // Swap amount beklenenin %10'undan azsa, büyük ihtimalle Leg 2 çalışmış
+    // ama checkLeg2AlreadySucceeded tespit edememiştir. SOL'un native vs wSOL
+    // farklı yerlerde olması karışıklığa neden olabilir.
+    const lowThreshold = (params.stuckAmountRaw * BigInt(10)) / BigInt(100);
+    if (unwindAmount > BigInt(0) && unwindAmount < lowThreshold) {
+      console.warn(
+        `[EMERGENCY-UNWIND] ⚠ SWAP AMOUNT ÇOK DÜŞÜK: ` +
+        `${unwindAmount.toString()} / beklenen ${params.stuckAmountRaw.toString()} ` +
+        `(${((Number(unwindAmount) / Number(params.stuckAmountRaw)) * 100).toFixed(1)}%). ` +
+        `Leg 2 zaten başarılı olmuş olabilir — yine de tüm SOL'u kurtarmaya çalışıyoruz.`
+      );
+
+      // Tüm native SOL'u kullan — rent reserve'den sonra ne varsa
+      const solBalance = await getConnection().getBalance(params.signer.publicKey);
+      const totalUsable = BigInt(solBalance) - BigInt(10_000_000); // rent reserve
+      if (totalUsable > unwindAmount) {
+        console.log(
+          `[EMERGENCY-UNWIND] Native SOL balance güncellendi: ` +
+          `${unwindAmount.toString()} → ${totalUsable.toString()}`
+        );
+        unwindAmount = totalUsable;
+        wrapAndUnwrapSol = true;
+      }
+    }
+  } else {
+    // SPL token: ATA'dan balance oku
+    const ata = deriveATA(params.signer.publicKey, new PublicKey(targetMint));
+    const ataInfo = await connection.getTokenAccountBalance(ata).catch(() => null);
+    if (ataInfo) {
+      const ataBalance = BigInt(ataInfo.value.amount);
+      if (ataBalance > BigInt(0) && ataBalance !== unwindAmount) {
+        console.log(
+          `[EMERGENCY-UNWIND] SPL token ATA bakiyesi güncellendi: ` +
+          `${unwindAmount.toString()} → ${ataBalance.toString()}`
+        );
+        unwindAmount = ataBalance;
+      }
+    }
   }
 
   if (unwindAmount <= BigInt(0)) {
-    const failReason = `No SOL balance found (ATA or native) to unwind`;
+    const failReason = `No ${params.targetToken} balance found to unwind — Leg 2 might have already succeeded`;
     console.error(`[EMERGENCY-UNWIND] ${failReason}`);
+
+    // Leg 2 başarılı olmuş olabilir — circuit breaker'ı sıfırla
+    resetCircuitBreaker();
+
     const tel = buildTelemetry({
       direction: params.direction,
       targetToken: params.targetToken,
@@ -748,6 +1056,10 @@ export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<Em
     appendTradeLog(tel);
     return { success: false, failReason, attempts: 0 };
   }
+
+  // Gerçek trade miktarı — loss hesabı için
+  const actualTradeUsdc = params.actualTradeAmountUsdc ?? cfg.notionalCapUsd;
+  const originalInputRaw = toRaw(actualTradeUsdc, usdcDecimals);
 
   for (let attempt = 1; attempt <= UNWIND_MAX_RETRIES; attempt++) {
     try {
@@ -789,8 +1101,7 @@ export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<Em
         `recovered≈${meta.expectedOut.toString()} raw USDC`
       );
 
-      // Loss hesapla (orijinal 500 USDC'den ne kadar kayıp)
-      const originalInputRaw = toRaw(cfg.notionalCapUsd, usdcDecimals);
+      // Loss hesapla (gerçek trade miktarından kaybı hesapla)
       const lossRaw = originalInputRaw - meta.expectedOut;
       const lossUsdc = Number(lossRaw) / 10 ** usdcDecimals;
 
@@ -801,7 +1112,7 @@ export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<Em
         sendSignatures: [params.leg1Signature ?? "", signature],
         success: true,
         status: "EMERGENCY_UNWIND_SUCCESS",
-        failReason: `Unwind after Leg2 failure. Loss: ${lossUsdc.toFixed(4)} USDC`,
+        failReason: `Unwind after Leg2 failure. Trade: ${actualTradeUsdc} USDC, Recovered: ${(Number(meta.expectedOut) / 10 ** usdcDecimals).toFixed(4)} USDC, Loss: ${lossUsdc.toFixed(4)} USDC`,
         netProfit: { grossProfitUsdc: -lossUsdc, feeUsdc: 0, netProfitUsdc: -lossUsdc },
       });
       appendTradeLog(tel);
@@ -827,6 +1138,29 @@ export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<Em
         const backoffMs = 500 * 2 ** (attempt - 1);
         console.log(`[EMERGENCY-UNWIND] ${backoffMs}ms backoff bekleniyor…`);
         await new Promise((r) => setTimeout(r, backoffMs));
+
+        // Her retry arasında bakiye tekrar kontrol et
+        // Leg 2 sonradan confirm olmuş olabilir
+        if (isNativeSol) {
+          const recheck = await checkLeg2AlreadySucceeded(
+            params.signer.publicKey,
+            params.targetToken,
+            params.stuckAmountRaw,
+          );
+          if (recheck.likely) {
+            console.warn(
+              `[EMERGENCY-UNWIND] ★ Retry ${attempt} sonrası Leg 2 artık ON-CHAIN! ` +
+              `Token balance: ${recheck.currentTokenBalance.toString()}. Unwind durduruluyor.`
+            );
+            resetCircuitBreaker();
+            return {
+              success: true,
+              failReason: "Leg 2 confirmed during unwind retry — no unwind needed",
+              attempts: attempt,
+              leg2AlreadySucceeded: true,
+            };
+          }
+        }
       }
     }
   }
@@ -851,5 +1185,283 @@ export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<Em
     success: false,
     failReason,
     attempts: UNWIND_MAX_RETRIES,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ║  JITO ATOMIC ARBITRAGE — Her iki bacağı tek bundle'da gönderir      ║
+// ║  Leg1 + Leg2 + Tip TX → aynı blokta atomik olarak çalışır          ║
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface AtomicArbitrageParams {
+  /** buildAndSimulate sonucu — her iki bacağın TX'leri */
+  buildResult: BuildSimulateResult;
+  /** Cüzdan keypair */
+  signer: Keypair;
+  /** İşlem yapılan target token */
+  targetToken: TokenSymbol;
+}
+
+export interface AtomicArbitrageResult {
+  /** Bundle başarılı şekilde land etti mi */
+  success: boolean;
+  /** Jito bundle UUID */
+  bundleId?: string;
+  /** TX imzaları (Leg1, Leg2, Tip) */
+  signatures: string[];
+  /** Bundle'ın land ettiği slot */
+  landedSlot?: number;
+  /** Hata nedeni */
+  failReason?: string;
+  /** Toplam deneme sayısı */
+  attempts: number;
+  /** Bundle hazırlama verisi */
+  bundleData?: AtomicBundleData;
+  /**
+   * Bundle land etmedi/hata verdi ama Leg1 on-chain ise true.
+   * priceTicker bu durumda emergency unwind tetikler.
+   */
+  leg1OnChainButLeg2Failed?: boolean;
+  /** Leg1 on-chain signature (emergency unwind referansı) */
+  leg1Signature?: string;
+}
+
+/** Jito bundle max retry sayısı */
+const MAX_BUNDLE_ATTEMPTS = 3;
+
+/**
+ * Atomik 2-leg arbitraj: Jito bundle ile her iki bacağı tek blokta çalıştırır.
+ *
+ * Akış:
+ * 1. buildAndSimulate sonucundan Leg1 + Leg2 TX'lerini al
+ * 2. Ortak blockhash + tip TX ile bundle hazırla
+ * 3. Bundle'ı Jito Block Engine'e gönder
+ * 4. Landing durumunu takip et
+ * 5. Başarısızlıkta: on-chain doğrulama yap
+ *    - Hiçbiri land etmediyse → temiz başarısızlık (kayıp yok)
+ *    - Sadece Leg1 land ettiyse → emergency unwind gerekli
+ *    - İkisi de land ettiyse → başarı (Jito status gecikmeli)
+ *
+ * ⚠️ NOT: Bu fonksiyon buildResult'taki TX'leri IN-PLACE değiştirir.
+ */
+export async function executeAtomicArbitrage(
+  params: AtomicArbitrageParams
+): Promise<AtomicArbitrageResult> {
+  const cfg = loadConfig();
+  const { buildResult, signer, targetToken } = params;
+  const pair = pairFromToken(targetToken);
+
+  console.log(
+    `\n[JITO-ATOMIC] ═══════════════════════════════════════════\n` +
+      `  Pair: ${pair} | Direction: ${buildResult.direction}\n` +
+      `  Net Profit (estimate): ${buildResult.netProfit.netProfitUsdc.toFixed(6)} USDC\n` +
+      `  Tip: ${cfg.jitoTipLamports} lamports\n` +
+      `═══════════════════════════════════════════════════════\n`
+  );
+
+  // ── 1. Bundle hazırla ──
+  const leg1Tx = buildResult.legs[0].tx;
+  const leg2Tx = buildResult.legs[1].tx;
+
+  let bundleData: AtomicBundleData;
+  try {
+    bundleData = await prepareAtomicBundle({
+      leg1Tx,
+      leg2Tx,
+      signer,
+      tipLamports: cfg.jitoTipLamports,
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`[JITO-ATOMIC] Bundle hazırlama hatası: ${reason}`);
+    return {
+      success: false,
+      signatures: [],
+      failReason: `Bundle prepare failed: ${reason}`,
+      attempts: 0,
+    };
+  }
+
+  // ── 2. Bundle'ı gönder (retry mekanizmalı) ──
+  for (let attempt = 1; attempt <= MAX_BUNDLE_ATTEMPTS; attempt++) {
+    try {
+      const bundleId = await sendJitoBundle(bundleData.signedTxs);
+
+      // ── 3. Landing bekle ──
+      const landing = await waitForBundleLanding(bundleId, 30_000);
+
+      if (landing.success) {
+        // ✓ Bundle land etti — tüm TX'ler aynı blokta başarılı
+        console.log(
+          `[JITO-ATOMIC] ✓ BAŞARILI! Bundle=${bundleId.slice(0, 16)}… ` +
+            `slot=${landing.landedSlot}`
+        );
+        consecutiveFailedSends = 0;
+        return {
+          success: true,
+          bundleId,
+          signatures: landing.signatures.length > 0
+            ? landing.signatures
+            : bundleData.txSignatures,
+          landedSlot: landing.landedSlot,
+          attempts: attempt,
+          bundleData,
+        };
+      }
+
+      // ── Bundle land etmedi — sebebi kontrol et ──
+      if (landing.status === "Invalid") {
+        // Format hatası — retry anlamsız
+        return {
+          success: false,
+          bundleId,
+          signatures: bundleData.txSignatures,
+          failReason: landing.failReason ?? "Invalid bundle format",
+          attempts: attempt,
+          bundleData,
+        };
+      }
+
+      if (landing.status === "Failed") {
+        // Simülasyon hatası — TX'ler zincire gönderilmedi
+        // On-chain kontrol yap (güvenlik)
+        console.log(
+          `[JITO-ATOMIC] Bundle Failed — on-chain doğrulama yapılıyor…`
+        );
+        const verify = await checkBundleTxResults(
+          bundleData.txSignatures[0],
+          bundleData.txSignatures[1]
+        );
+
+        if (verify.outcome === "bothSucceeded") {
+          // Jito status gecikmeli olabilir
+          console.log(
+            `[JITO-ATOMIC] ★ Jito Failed dedi AMA her iki TX de on-chain!`
+          );
+          consecutiveFailedSends = 0;
+          return {
+            success: true,
+            bundleId,
+            signatures: bundleData.txSignatures,
+            attempts: attempt,
+            bundleData,
+          };
+        }
+
+        if (verify.outcome === "leg1Only") {
+          // Leg1 on-chain, Leg2 yok → priceTicker emergency unwind tetikler
+          return {
+            success: false,
+            bundleId,
+            signatures: bundleData.txSignatures,
+            failReason:
+              "Bundle failed: Leg1 on-chain but Leg2 missing — unwind needed",
+            attempts: attempt,
+            bundleData,
+            leg1OnChainButLeg2Failed: true,
+            leg1Signature: bundleData.txSignatures[0],
+          };
+        }
+
+        // Hiçbiri on-chain değil — temiz başarısızlık
+        if (attempt < MAX_BUNDLE_ATTEMPTS) {
+          console.log(
+            `[JITO-ATOMIC] Attempt ${attempt} failed — retry…`
+          );
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+
+        return {
+          success: false,
+          bundleId,
+          signatures: bundleData.txSignatures,
+          failReason: landing.failReason ?? "Bundle simulation failed",
+          attempts: attempt,
+          bundleData,
+        };
+      }
+
+      // Timeout — TX'ler hâlâ pending olabilir
+      if (landing.status === "Timeout") {
+        console.log(
+          `[JITO-ATOMIC] Bundle Timeout — on-chain doğrulama yapılıyor…`
+        );
+        const verify = await checkBundleTxResults(
+          bundleData.txSignatures[0],
+          bundleData.txSignatures[1]
+        );
+
+        if (verify.outcome === "bothSucceeded") {
+          consecutiveFailedSends = 0;
+          return {
+            success: true,
+            bundleId,
+            signatures: bundleData.txSignatures,
+            attempts: attempt,
+            bundleData,
+          };
+        }
+
+        if (verify.outcome === "leg1Only") {
+          return {
+            success: false,
+            bundleId,
+            signatures: bundleData.txSignatures,
+            failReason:
+              "Bundle timeout: Leg1 on-chain but Leg2 missing — unwind needed",
+            attempts: attempt,
+            bundleData,
+            leg1OnChainButLeg2Failed: true,
+            leg1Signature: bundleData.txSignatures[0],
+          };
+        }
+
+        // Hiçbiri on-chain — retry veya başarısızlık
+        if (attempt < MAX_BUNDLE_ATTEMPTS) {
+          console.log(
+            `[JITO-ATOMIC] Timeout, TX'ler on-chain değil — retry…`
+          );
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+
+        return {
+          success: false,
+          bundleId,
+          signatures: bundleData.txSignatures,
+          failReason: landing.failReason ?? "Bundle landing timeout",
+          attempts: attempt,
+          bundleData,
+        };
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[JITO-ATOMIC] Attempt ${attempt} error: ${reason}`
+      );
+
+      if (err instanceof JitoBundleError && attempt < MAX_BUNDLE_ATTEMPTS) {
+        console.log(`[JITO-ATOMIC] Retry after Jito error…`);
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+
+      return {
+        success: false,
+        signatures: bundleData.txSignatures,
+        failReason: `Jito bundle error: ${reason}`,
+        attempts: attempt,
+        bundleData,
+      };
+    }
+  }
+
+  return {
+    success: false,
+    signatures: bundleData?.txSignatures ?? [],
+    failReason: `Bundle failed after ${MAX_BUNDLE_ATTEMPTS} attempts`,
+    attempts: MAX_BUNDLE_ATTEMPTS,
+    bundleData,
   };
 }

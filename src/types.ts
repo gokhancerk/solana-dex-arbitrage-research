@@ -1,10 +1,11 @@
 import type { VersionedTransaction } from "@solana/web3.js";
+import type { TradePair, TokenSymbol } from "./config.js";
 
 export type Direction = "JUP_TO_OKX" | "OKX_TO_JUP";
 
 /*
- * JUP_TO_OKX  = Leg1: Jupiter USDC→SOL, Leg2: OKX SOL→USDC
- * OKX_TO_JUP  = Leg1: OKX USDC→SOL,     Leg2: Jupiter SOL→USDC
+ * JUP_TO_OKX  = Leg1: Jupiter USDC→<token>, Leg2: OKX <token>→USDC
+ * OKX_TO_JUP  = Leg1: OKX USDC→<token>,     Leg2: Jupiter <token>→USDC
  */
 
 export interface QuoteMeta {
@@ -92,8 +93,9 @@ export type TelemetryStatus =
   | "UNKNOWN_ERROR";
 
 export interface Telemetry {
-  pair: "SOL/USDC";
+  pair: TradePair;
   direction: Direction;
+  targetToken?: TokenSymbol;
   simulatedAmountOut: string;
   realizedAmountOut?: string;
   effectiveSlippageBps?: number;

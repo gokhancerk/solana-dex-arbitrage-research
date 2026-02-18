@@ -1,12 +1,12 @@
 import { PublicKey } from "@solana/web3.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type TokenSymbol } from "./config.js";
 
 export interface MintAmount {
   mint: string;
   decimals: number;
 }
 
-export function getMintInfo(symbol: "USDC" | "SOL"): MintAmount {
+export function getMintInfo(symbol: "USDC" | TokenSymbol): MintAmount {
   const cfg = loadConfig();
   const token = cfg.tokens[symbol];
   if (!token) {

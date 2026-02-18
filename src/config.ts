@@ -7,8 +7,17 @@ export interface RpcConfig {
   wsBackup?: string;
 }
 
+/** Taranabilir tüm token sembolleri */
+export type TokenSymbol = "WIF" | "JUP" | "SOL" | "BONK" | "WEN" | "PYTH";
+
+/** Desteklenen tüm trade çiftleri */
+export type TradePair = "WIF/USDC" | "JUP/USDC" | "SOL/USDC" | "BONK/USDC" | "WEN/USDC" | "PYTH/USDC";
+
+/** Round-Robin sırasına göre taranacak target tokenlar */
+export const SCANNABLE_TOKENS: readonly TokenSymbol[] = ["WIF", "JUP", "SOL", "BONK", "WEN", "PYTH"] as const;
+
 export interface TokenConfig {
-  symbol: "USDC" | "SOL";
+  symbol: "USDC" | TokenSymbol;
   mint: string;
   decimals: number;
 }
@@ -62,12 +71,22 @@ export function loadConfig(): AppConfig {
   const rpcBackup = (process.env.SOLANA_RPC_BACKUP || heliusHttp) as string | undefined;
 
   // Token mints must align across venues; provide via env for explicitness.
-  const solMint = process.env.SOL_MINT ?? "So11111111111111111111111111111111111111112";
   const usdcMint = requireEnv("USDC_MINT") as string; // e.g. EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+  const wifMint  = process.env.WIF_MINT  ?? "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm";
+  const jupMint  = process.env.JUP_MINT  ?? "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
+  const solMint  = process.env.SOL_MINT  ?? "So11111111111111111111111111111111111111112";
+  const bonkMint = process.env.BONK_MINT ?? "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+  const wenMint  = process.env.WEN_MINT  ?? "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk";
+  const pythMint = process.env.PYTH_MINT ?? "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3";
 
   const tokens: Record<string, TokenConfig> = {
-    SOL: { symbol: "SOL", mint: solMint, decimals: Number(process.env.SOL_DECIMALS ?? 9) },
-    USDC: { symbol: "USDC", mint: usdcMint, decimals: Number(process.env.USDC_DECIMALS ?? 6) }
+    WIF:  { symbol: "WIF",  mint: wifMint,  decimals: Number(process.env.WIF_DECIMALS  ?? 6) },
+    JUP:  { symbol: "JUP",  mint: jupMint,  decimals: Number(process.env.JUP_DECIMALS  ?? 6) },
+    SOL:  { symbol: "SOL",  mint: solMint,  decimals: Number(process.env.SOL_DECIMALS  ?? 9) },
+    BONK: { symbol: "BONK", mint: bonkMint, decimals: Number(process.env.BONK_DECIMALS ?? 5) },
+    WEN:  { symbol: "WEN",  mint: wenMint,  decimals: Number(process.env.WEN_DECIMALS  ?? 5) },
+    PYTH: { symbol: "PYTH", mint: pythMint, decimals: Number(process.env.PYTH_DECIMALS ?? 6) },
+    USDC: { symbol: "USDC", mint: usdcMint, decimals: Number(process.env.USDC_DECIMALS ?? 6) },
   };
 
   return {

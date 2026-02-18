@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import { BuildSimulateResult, Telemetry, TelemetryStatus, Direction, NetProfitInfo } from "./types.js";
+import type { TradePair, TokenSymbol } from "./config.js";
 
 // ───── Logs directory & file path ─────
 const LOGS_DIR = path.resolve(process.cwd(), "logs");
@@ -24,6 +25,8 @@ async function ensureLogsDir(): Promise<void> {
 export interface BuildTelemetryParams {
   build?: BuildSimulateResult;
   direction: Direction;
+  /** Hangi token üzerinden arbitraj yapıldı (WIF veya JUP). Varsayılan: WIF */
+  targetToken?: TokenSymbol;
   sendSignatures?: string[];
   realizedOut?: bigint;
   success: boolean;
@@ -36,6 +39,7 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
   const {
     build,
     direction,
+    targetToken = "WIF",
     sendSignatures = [],
     realizedOut,
     success,
@@ -43,6 +47,8 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
     status,
     netProfit,
   } = params;
+
+  const pair: TradePair = `${targetToken}/USDC` as TradePair;
 
   const lastLeg = build?.legs.at(-1);
   const expectedOut = lastLeg?.expectedOut ?? BigInt(0);
@@ -61,8 +67,9 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
   }
 
   return {
-    pair: "SOL/USDC",
+    pair,
     direction,
+    targetToken,
     simulatedAmountOut: simulatedStr,
     realizedAmountOut: realizedStr,
     effectiveSlippageBps,

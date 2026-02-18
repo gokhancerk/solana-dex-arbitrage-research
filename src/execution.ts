@@ -1,7 +1,8 @@
 import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
-import { getConnection, sendVersionedWithOpts } from "./solana.js";
+import { getConnection, sendVersionedWithOpts, resolveSolBalance } from "./solana.js";
 import { loadConfig, type TokenSymbol, type TradePair } from "./config.js";
 import { toRaw } from "./tokens.js";
+import { suggestPriorityFee } from "./fees.js";
 import {
   Direction,
   BuildSimulateResult,
@@ -23,7 +24,37 @@ import { buildTelemetry, appendTradeLog } from "./telemetry.js";
 
 let consecutiveFailedSends = 0;
 
+/** Reset circuit breaker counter (called after successful unwind or manual reset) */
+export function resetCircuitBreaker(): void {
+  consecutiveFailedSends = 0;
+}
+
 // ───── Net Profit Helpers ─────
+
+/**
+ * Dinamik priority fee: zincirden güncel fee çeker ve config ile cap'ler.
+ * Sonucu cache'ler (fees.ts 10s TTL) — her çağrıda RPC yapmaz.
+ */
+let _resolvedPriorityFee: number | undefined;
+
+async function resolvePriorityFee(): Promise<number> {
+  const cfg = loadConfig();
+  if (!cfg.dynamicPriorityFee) {
+    return cfg.rpc.priorityFeeMicrolamports ?? 50_000;
+  }
+  // Cache kontrolü — aynı tick içinde tekrar RPC çağrısı yapmaz
+  if (_resolvedPriorityFee !== undefined) return _resolvedPriorityFee;
+
+  const connection = getConnection();
+  const suggestion = await suggestPriorityFee(connection, cfg.maxPriorityFee);
+  _resolvedPriorityFee = suggestion?.priorityFeeMicrolamports ?? cfg.rpc.priorityFeeMicrolamports ?? 50_000;
+  // 30 saniye sonra resetle — sonraki tick'te taze fee alınsın
+  setTimeout(() => { _resolvedPriorityFee = undefined; }, 30_000);
+  return _resolvedPriorityFee;
+}
+
+/** Export for PriceTicker to pre-resolve before estimate cycle */
+export { resolvePriorityFee };
 
 /**
  * Estimate total Solana network fee for a given number of transaction legs.
@@ -143,7 +174,9 @@ export async function estimateDirectionProfit(params: {
 
   const grossProfitRaw = finalOutRaw - amountRaw;
   const grossProfitUsdc = Number(grossProfitRaw) / 10 ** usdcDecimals;
-  const feeSol = estimateTxFeeSol(cfg.rpc.priorityFeeMicrolamports, 2);
+  // Dinamik priority fee kullan — sabit yerine zincirden güncel fee
+  const dynamicFee = await resolvePriorityFee();
+  const feeSol = estimateTxFeeSol(dynamicFee, 2);
   const estFeeUsdc = estimateFeeUsdc(feeSol, cfg.solUsdcRate);
   const netProfitUsdc = grossProfitUsdc - estFeeUsdc;
 
@@ -263,6 +296,8 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
   const legs: SimulatedLeg[] = [];
   const quoteMeta = [] as BuildSimulateResult["quoteMeta"];
+  // Dinamik fee — swap TX'lere iletilecek
+  const dynFee = await resolvePriorityFee();
 
   if (params.direction === "JUP_TO_OKX") {
     // ── Leg 1: Jupiter USDC → targetToken (█ HER ZAMAN TAZE QUOTE █) ──
@@ -280,7 +315,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
     console.log("[DEBUG] Jupiter swap TX oluşturuluyor...");
     const t1 = Date.now();
-    const jupTx = await buildJupiterSwap({ route, userPublicKey: params.owner });
+    const jupTx = await buildJupiterSwap({ route, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
     console.log(`[DEBUG] Jupiter swap TX hazır (${Date.now() - t1}ms)`);
 
     const jupLeg: SimulatedLeg = {
@@ -307,6 +342,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       amount: meta.expectedOut,
       slippageBps: cfg.slippageBps,
       userPublicKey: ownerStr,
+      priorityFeeMicroLamports: dynFee,
     });
     console.log(`[DEBUG] OKX swap TX + meta hazır (${Date.now() - t4}ms) — expectedOut=${okxMeta.expectedOut.toString()}`);
     quoteMeta.push(okxMeta);
@@ -338,6 +374,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       amount: amountRaw,
       slippageBps: cfg.slippageBps,
       userPublicKey: ownerStr,
+      priorityFeeMicroLamports: dynFee,
     });
     console.log(`[DEBUG] OKX swap TX + meta hazır (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
     quoteMeta.push(meta);
@@ -372,7 +409,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
     console.log("[DEBUG] Jupiter swap TX oluşturuluyor...");
     const t4 = Date.now();
-    const jupTx = await buildJupiterSwap({ route, userPublicKey: params.owner });
+    const jupTx = await buildJupiterSwap({ route, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
     console.log(`[DEBUG] Jupiter swap TX hazır (${Date.now() - t4}ms)`);
 
     const jupLeg: SimulatedLeg = {
@@ -405,7 +442,9 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
   const grossProfitRaw = leg2ExpectedOut - inputRaw;
   const grossProfitUsdc = Number(grossProfitRaw) / 10 ** usdcDecimals;
-  const feeSol = estimateTxFeeSol(cfg.rpc.priorityFeeMicrolamports, legs.length);
+  // Dinamik priority fee kullan
+  const dynamicFee = await resolvePriorityFee();
+  const feeSol = estimateTxFeeSol(dynamicFee, legs.length);
   const feeUsdc = estimateFeeUsdc(feeSol, cfg.solUsdcRate);
   const netProfitUsdc = grossProfitUsdc - feeUsdc;
   const netProfit: NetProfitInfo = { grossProfitUsdc, feeUsdc, netProfitUsdc };
@@ -510,4 +549,307 @@ export async function sendWithRetry(
   }
 
   throw new SendError("Unexpected send loop exit");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ║  BUILD FRESH LEG 2 — Leg 1 onaylandıktan sonra taze TX oluşturur  ║
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface BuildFreshLeg2Params {
+  /** Original direction of the arb trade */
+  direction: Direction;
+  /** Token being traded */
+  targetToken: TokenSymbol;
+  /** Amount of target token received from Leg 1 (raw units) */
+  leg1ReceivedAmount: bigint;
+  /** Wallet public key */
+  owner: PublicKey;
+}
+
+export interface FreshLeg2Result {
+  tx: VersionedTransaction;
+  meta: QuoteMeta;
+  venue: "JUPITER" | "OKX";
+}
+
+/**
+ * Leg 1 on-chain confirm olduktan sonra Leg 2'yi tamamen yeniden oluşturur:
+ *  - Taze quote (yeni fiyat)
+ *  - Taze blockhash (expire etmez)
+ *  - Leg 1'den gelen GERÇEK miktar kullanılır (tahmini değil)
+ *
+ * JUP_TO_OKX → Leg 2 = OKX (targetToken → USDC)
+ * OKX_TO_JUP → Leg 2 = Jupiter (targetToken → USDC)
+ */
+export async function buildFreshLeg2(params: BuildFreshLeg2Params): Promise<FreshLeg2Result> {
+  const cfg = loadConfig();
+  const ownerStr = params.owner.toBase58();
+  const usdcMint = cfg.tokens.USDC.mint;
+  const targetMint = cfg.tokens[params.targetToken].mint;
+
+  if (params.direction === "JUP_TO_OKX") {
+    // Leg 2 = OKX targetToken → USDC
+    console.log(
+      `[FRESH-LEG2] OKX swap-instruction isteniyor (${params.targetToken}→USDC), ` +
+      `amount=${params.leg1ReceivedAmount.toString()}…`
+    );
+    const t0 = Date.now();
+    const { tx, meta } = await buildOkxSwap({
+      inputMint: targetMint,
+      outputMint: usdcMint,
+      amount: params.leg1ReceivedAmount,
+      slippageBps: cfg.slippageBps,
+      userPublicKey: ownerStr,
+    });
+    console.log(`[FRESH-LEG2] OKX TX hazır (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
+    return { tx, meta, venue: "OKX" };
+  } else {
+    // Leg 2 = Jupiter targetToken → USDC
+    const isNativeSol = params.targetToken === "SOL";
+    let swapAmount = params.leg1ReceivedAmount;
+    let wrapAndUnwrapSol = !isNativeSol;  // default: diğer tokenlar true, SOL false
+
+    // SOL ise on-chain bakiyeyi kontrol et — OKX unwrap etmiş olabilir
+    if (isNativeSol) {
+      const solInfo = await resolveSolBalance(
+        params.owner,
+        new PublicKey(targetMint),
+        params.leg1ReceivedAmount
+      );
+      swapAmount = solInfo.swapAmount;
+      wrapAndUnwrapSol = solInfo.wrapAndUnwrapSol;
+      console.log(
+        `[FRESH-LEG2] SOL bakiye tespiti: useAta=${solInfo.useAta}, ` +
+        `swapAmount=${swapAmount.toString()}, wrapAndUnwrapSol=${wrapAndUnwrapSol}`
+      );
+    }
+
+    console.log(
+      `[FRESH-LEG2] Jupiter TAZE quote isteniyor (${params.targetToken}→USDC), ` +
+      `amount=${swapAmount.toString()}…`
+    );
+    const t0 = Date.now();
+    const { route, meta } = await fetchJupiterQuote({
+      inputMint: targetMint,
+      outputMint: usdcMint,
+      amount: swapAmount,
+      slippageBps: cfg.slippageBps,
+    });
+    console.log(`[FRESH-LEG2] Jupiter quote alındı (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
+
+    const t1 = Date.now();
+    const tx = await buildJupiterSwap({
+      route,
+      userPublicKey: params.owner,
+      wrapAndUnwrapSol: wrapAndUnwrapSol,
+    });
+    console.log(`[FRESH-LEG2] Jupiter TX hazır (${Date.now() - t1}ms) wrapAndUnwrapSol=${wrapAndUnwrapSol}`);
+    return { tx, meta, venue: "JUPITER" };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ║  EMERGENCY UNWIND — Leg 2 başarısız olduğunda sermayeyi kurtarır   ║
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface EmergencyUnwindParams {
+  /** Token stuck in wallet after Leg 1 succeeded but Leg 2 failed */
+  targetToken: TokenSymbol;
+  /** Approximate amount of stuck token (raw units). Uses on-chain balance if available. */
+  stuckAmountRaw: bigint;
+  /** Wallet keypair for signing */
+  signer: Keypair;
+  /** Original direction that failed */
+  direction: Direction;
+  /** Leg 1 signature for telemetry cross-reference */
+  leg1Signature?: string;
+}
+
+export interface EmergencyUnwindResult {
+  success: boolean;
+  /** TX signature if unwind succeeded */
+  signature?: string;
+  /** USDC recovered (raw units) */
+  recoveredUsdcRaw?: bigint;
+  /** Loss compared to original input (can be negative = worse) */
+  lossUsdc?: number;
+  /** Reason for failure */
+  failReason?: string;
+  /** Number of attempts made */
+  attempts: number;
+}
+
+/** Emergency unwind uses Jupiter (most liquid, most reliable) to dump token → USDC */
+const UNWIND_MAX_RETRIES = 5;
+/** Emergency slippage: 1% — accept small loss to recover capital */
+const UNWIND_SLIPPAGE_BPS = 100;
+
+/**
+ * Acil sermaye kurtarma: Leg 2 başarısız olduğunda cüzdandaki
+ * takılı token'ı Jupiter üzerinden USDC'ye çevirir.
+ *
+ * - Jupiter kullanır (en likit, en güvenilir)
+ * - Daha yüksek slippage (1%) kabul eder — amaç sermaye kurtarma, kâr değil
+ * - 5 retry, agresif backoff
+ * - Telemetri kaydı yapılır (EMERGENCY_UNWIND_SUCCESS/FAILED)
+ * - Circuit breaker'ı resetler (başarılı ise)
+ */
+export async function emergencyUnwind(params: EmergencyUnwindParams): Promise<EmergencyUnwindResult> {
+  const cfg = loadConfig();
+  const connection = getConnection();
+  const ownerStr = params.signer.publicKey.toBase58();
+  const usdcMint = cfg.tokens.USDC.mint;
+  const targetMint = cfg.tokens[params.targetToken].mint;
+  const usdcDecimals = cfg.tokens.USDC.decimals;
+  const pair = pairFromToken(params.targetToken);
+
+  console.warn(
+    `\n[EMERGENCY-UNWIND] ★★★ BAŞLATILIYOR ★★★\n` +
+    `  Token: ${params.targetToken}\n` +
+    `  Stuck Amount: ${params.stuckAmountRaw.toString()} raw\n` +
+    `  Yön: ${params.direction}\n` +
+    `  Leg1 Sig: ${params.leg1Signature ?? "n/a"}\n` +
+    `  Max Retry: ${UNWIND_MAX_RETRIES}, Slippage: ${UNWIND_SLIPPAGE_BPS} BPS (${UNWIND_SLIPPAGE_BPS / 100}%)\n`
+  );
+
+  // SOL ise on-chain bakiyeyi kontrol et — OKX unwrap etmiş olabilir
+  const isNativeSol = params.targetToken === "SOL";
+  let unwindAmount = params.stuckAmountRaw;
+  let wrapAndUnwrapSol = !isNativeSol;  // default: diğer tokenlar true, SOL false
+
+  if (isNativeSol) {
+    const solInfo = await resolveSolBalance(
+      params.signer.publicKey,
+      new PublicKey(targetMint),
+      params.stuckAmountRaw
+    );
+    unwindAmount = solInfo.swapAmount;
+    wrapAndUnwrapSol = solInfo.wrapAndUnwrapSol;
+    console.log(
+      `[EMERGENCY-UNWIND] SOL bakiye tespiti: useAta=${solInfo.useAta}, ` +
+      `ataBalance=${solInfo.wsolAtaBalance.toString()}, ` +
+      `nativeUsable=${solInfo.usableNativeLamports.toString()}, ` +
+      `swapAmount=${unwindAmount.toString()}, wrapAndUnwrapSol=${wrapAndUnwrapSol}`
+    );
+  }
+
+  if (unwindAmount <= BigInt(0)) {
+    const failReason = `No SOL balance found (ATA or native) to unwind`;
+    console.error(`[EMERGENCY-UNWIND] ${failReason}`);
+    const tel = buildTelemetry({
+      direction: params.direction,
+      targetToken: params.targetToken,
+      sendSignatures: [params.leg1Signature ?? ""],
+      success: false,
+      status: "EMERGENCY_UNWIND_FAILED",
+      failReason,
+      netProfit: { grossProfitUsdc: 0, feeUsdc: 0, netProfitUsdc: 0 },
+    });
+    appendTradeLog(tel);
+    return { success: false, failReason, attempts: 0 };
+  }
+
+  for (let attempt = 1; attempt <= UNWIND_MAX_RETRIES; attempt++) {
+    try {
+      // 1. Taze Jupiter quote: targetToken → USDC
+      console.log(`[EMERGENCY-UNWIND] Attempt ${attempt}/${UNWIND_MAX_RETRIES} — Jupiter quote isteniyor (amount=${unwindAmount.toString()})…`);
+      const t0 = Date.now();
+      const { route, meta } = await fetchJupiterQuote({
+        inputMint: targetMint,
+        outputMint: usdcMint,
+        amount: unwindAmount,
+        slippageBps: UNWIND_SLIPPAGE_BPS,
+      });
+      console.log(
+        `[EMERGENCY-UNWIND] Quote alındı (${Date.now() - t0}ms) — ` +
+        `expectedOut=${meta.expectedOut.toString()} raw USDC`
+      );
+
+      // 2. TX oluştur (taze blockhash)
+      const tx = await buildJupiterSwap({
+        route,
+        userPublicKey: params.signer.publicKey,
+        wrapAndUnwrapSol: wrapAndUnwrapSol,
+      });
+      console.log(
+        `[EMERGENCY-UNWIND] wrapAndUnwrapSol=${wrapAndUnwrapSol} — ` +
+        (wrapAndUnwrapSol ? 'native SOL wrap edilecek' : 'mevcut wSOL ATA kullanılacak')
+      );
+
+      // 3. Sign & send
+      tx.sign([params.signer]);
+      const signature = await sendVersionedWithOpts(connection, tx, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+        maxRetries: 3,
+      });
+
+      console.log(
+        `[EMERGENCY-UNWIND] ✓ BAŞARILI — sig=${signature}, ` +
+        `recovered≈${meta.expectedOut.toString()} raw USDC`
+      );
+
+      // Loss hesapla (orijinal 500 USDC'den ne kadar kayıp)
+      const originalInputRaw = toRaw(cfg.notionalCapUsd, usdcDecimals);
+      const lossRaw = originalInputRaw - meta.expectedOut;
+      const lossUsdc = Number(lossRaw) / 10 ** usdcDecimals;
+
+      // Telemetri: başarılı unwind
+      const tel = buildTelemetry({
+        direction: params.direction,
+        targetToken: params.targetToken,
+        sendSignatures: [params.leg1Signature ?? "", signature],
+        success: true,
+        status: "EMERGENCY_UNWIND_SUCCESS",
+        failReason: `Unwind after Leg2 failure. Loss: ${lossUsdc.toFixed(4)} USDC`,
+        netProfit: { grossProfitUsdc: -lossUsdc, feeUsdc: 0, netProfitUsdc: -lossUsdc },
+      });
+      appendTradeLog(tel);
+
+      // Circuit breaker reset — bot tekrar trade yapabilir
+      resetCircuitBreaker();
+
+      return {
+        success: true,
+        signature,
+        recoveredUsdcRaw: meta.expectedOut,
+        lossUsdc,
+        attempts: attempt,
+      };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[EMERGENCY-UNWIND] Attempt ${attempt}/${UNWIND_MAX_RETRIES} BAŞARISIZ: ${reason}`
+      );
+
+      if (attempt < UNWIND_MAX_RETRIES) {
+        // Agresif backoff: 500ms, 1s, 2s, 4s
+        const backoffMs = 500 * 2 ** (attempt - 1);
+        console.log(`[EMERGENCY-UNWIND] ${backoffMs}ms backoff bekleniyor…`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+      }
+    }
+  }
+
+  // Tüm retry'lar başarısız
+  const failReason = `Emergency unwind FAILED after ${UNWIND_MAX_RETRIES} attempts — MANUAL INTERVENTION REQUIRED`;
+  console.error(`\n[EMERGENCY-UNWIND] ★★★ ${failReason} ★★★\n`);
+
+  // Telemetri: başarısız unwind
+  const tel = buildTelemetry({
+    direction: params.direction,
+    targetToken: params.targetToken,
+    sendSignatures: [params.leg1Signature ?? ""],
+    success: false,
+    status: "EMERGENCY_UNWIND_FAILED",
+    failReason,
+    netProfit: { grossProfitUsdc: 0, feeUsdc: 0, netProfitUsdc: 0 },
+  });
+  appendTradeLog(tel);
+
+  return {
+    success: false,
+    failReason,
+    attempts: UNWIND_MAX_RETRIES,
+  };
 }

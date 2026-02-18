@@ -5,7 +5,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import type { TradeLog } from "@/types";
-import { TrendingUp, CheckCircle, DollarSign } from "lucide-react";
+import { TrendingUp, CheckCircle, DollarSign, AlertTriangle } from "lucide-react";
 
 interface StatsCardsProps {
   logs: TradeLog[];
@@ -14,22 +14,36 @@ interface StatsCardsProps {
 export function StatsCards({ logs }: StatsCardsProps) {
   const totalOpportunities = logs.length;
 
-  const approvedTrades = logs.filter(
-    (l) => l.profitLabel === "profit" && l.netProfitUsdc > 0
+  // Sadece zincire başarıyla gönderilen işlemler (SEND_SUCCESS)
+  const onChainTrades = logs.filter(
+    (l) => l.status === "SEND_SUCCESS"
   );
-  const approvedCount = approvedTrades.length;
+
+  // Reddedilen / iptal edilen (zincire gitmedi)
+  const rejectedTrades = logs.filter(
+    (l) => l.status === "REJECTED_LOW_PROFIT" || l.status === "SIMULATION_SUCCESS"
+  );
+
+  // Winrate: zincire giden / toplam fırsat
+  const onChainCount = onChainTrades.length;
   const winrate =
     totalOpportunities > 0
-      ? ((approvedCount / totalOpportunities) * 100).toFixed(1)
+      ? ((onChainCount / totalOpportunities) * 100).toFixed(1)
       : "0.0";
 
-  const potentialNetProfit = approvedTrades.reduce(
-    (sum, l) => sum + l.netProfitUsdc,
-    0
-  );
+  // Realized PnL: zincirdeki gerçek kâr/zarar (varsa realized, yoksa tahmini)
+  const realizedNetProfit = onChainTrades.reduce((sum, l) => {
+    if (l.realizedPnl) return sum + l.realizedPnl.realizedNetProfitUsdc;
+    return sum + l.netProfitUsdc;
+  }, 0);
+
+  // Tahmini kâr (onaylanan ama henüz/hiç zincire gitmemiş dahil)
+  const estimatedProfit = rejectedTrades
+    .filter((l) => l.netProfitUsdc > 0)
+    .reduce((sum, l) => sum + l.netProfitUsdc, 0);
 
   return (
-    <div className="grid gap-4 md:grid-cols-3">
+    <div className="grid gap-4 md:grid-cols-4">
       {/* Toplam Fırsat */}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -44,44 +58,65 @@ export function StatsCards({ logs }: StatsCardsProps) {
         </CardContent>
       </Card>
 
-      {/* Onaylanan İşlemler / Winrate */}
+      {/* Zincire Giden İşlemler / Winrate */}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
           <CardTitle className="text-sm font-medium">
-            Onaylanan İşlemler (Winrate)
+            Zincirdeki İşlemler
           </CardTitle>
           <CheckCircle className="h-4 w-4 text-muted-foreground" />
         </CardHeader>
         <CardContent>
           <div className="text-2xl font-bold">
-            {approvedCount}{" "}
+            {onChainCount}{" "}
             <span className="text-lg font-normal text-muted-foreground">
               ({winrate}%)
             </span>
           </div>
           <p className="text-xs text-muted-foreground">
-            Eşiği geçen kârlı işlemler
+            On-chain başarılı gönderimler
           </p>
         </CardContent>
       </Card>
 
-      {/* Potansiyel Net Kâr */}
+      {/* Gerçek Net Kâr (On-Chain) */}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
           <CardTitle className="text-sm font-medium">
-            Potansiyel Net Kâr
+            Gerçek Net Kâr
           </CardTitle>
           <DollarSign className="h-4 w-4 text-muted-foreground" />
         </CardHeader>
         <CardContent>
-          <div className="text-2xl font-bold">
-            {potentialNetProfit.toFixed(4)}{" "}
+          <div className={`text-2xl font-bold ${realizedNetProfit >= 0 ? "text-emerald-500" : "text-red-500"}`}>
+            {realizedNetProfit.toFixed(4)}{" "}
             <span className="text-lg font-normal text-muted-foreground">
               USDC
             </span>
           </div>
           <p className="text-xs text-muted-foreground">
-            Onaylanan işlemlerin toplam net kârı
+            On-chain gerçekleşen kâr/zarar
+          </p>
+        </CardContent>
+      </Card>
+
+      {/* Kaçırılan Tahmini Kâr */}
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+          <CardTitle className="text-sm font-medium">
+            Kaçırılan (Tahmini)
+          </CardTitle>
+          <AlertTriangle className="h-4 w-4 text-muted-foreground" />
+        </CardHeader>
+        <CardContent>
+          <div className="text-2xl font-bold text-amber-500">
+            {estimatedProfit.toFixed(4)}{" "}
+            <span className="text-lg font-normal text-muted-foreground">
+              USDC
+            </span>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Eşik altı reddedilen fırsatlar
           </p>
         </CardContent>
       </Card>

@@ -32,23 +32,53 @@ function formatDate(ts: string): string {
 }
 
 function StatusBadge({ log }: { log: TradeLog }) {
-  if (log.profitLabel === "profit" && log.netProfitUsdc > 0) {
+  // On-chain başarılı gönderim
+  if (log.status === "SEND_SUCCESS") {
+    const isProfit = log.realizedPnl
+      ? log.realizedPnl.realizedNetProfitUsdc > 0
+      : log.netProfitUsdc > 0;
     return (
-      <Badge className="bg-emerald-600 hover:bg-emerald-700 text-white">
-        Kârlı
+      <Badge className={isProfit ? "bg-emerald-600 hover:bg-emerald-700 text-white" : "bg-red-600 hover:bg-red-700 text-white"}>
+        {isProfit ? "Kârlı ✓" : "Zararlı ✗"}
       </Badge>
     );
   }
-  if (log.profitLabel === "loss") {
+  // Net kâr eşiği altında reddedildi
+  if (log.status === "REJECTED_LOW_PROFIT") {
+    return (
+      <Badge variant="secondary" className="text-amber-600">
+        Eşik Altı
+      </Badge>
+    );
+  }
+  // Simülasyon başarılı ama gönderilmedi
+  if (log.status === "SIMULATION_SUCCESS" || log.status === "DRY_RUN_PROFITABLE") {
+    return (
+      <Badge variant="secondary">
+        Onay Bekliyor
+      </Badge>
+    );
+  }
+  // Emergency unwind
+  if (log.status?.startsWith("EMERGENCY_UNWIND")) {
     return (
       <Badge variant="destructive">
-        Reddedildi
+        Unwind
       </Badge>
     );
   }
+  // Leg2 hatası
+  if (log.status === "LEG2_REFRESH_FAILED") {
+    return (
+      <Badge variant="destructive">
+        Leg2 Hata
+      </Badge>
+    );
+  }
+  // Diğer hatalar
   return (
     <Badge variant="secondary">
-      Sabit
+      {log.status ?? "Bilinmeyen"}
     </Badge>
   );
 }

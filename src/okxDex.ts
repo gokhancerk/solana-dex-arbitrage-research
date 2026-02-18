@@ -15,28 +15,41 @@ const OKX_FETCH_TIMEOUT_MS = 15_000;
 
 // ── OKX Rate Limiter ────────────────────────────────────────────────
 /** Ardışık OKX API çağrıları arasında minimum bekleme süresi (ms) */
-const OKX_MIN_CALL_SPACING_MS = 600;
+const OKX_MIN_CALL_SPACING_MS = 1200;
 /** 429 hatası alındığında max retry sayısı */
 const OKX_429_MAX_RETRIES = 2;
 /** 429 retry backoff base (ms) — exponential: base * 2^(attempt-1) */
-const OKX_429_BACKOFF_BASE_MS = 800;
+const OKX_429_BACKOFF_BASE_MS = 2000;
 
-/** Son OKX API çağrısının timestamp'i */
+/** Son OKX API çağrısının TAMAMLANMA timestamp'i */
 let lastOkxCallTimestamp = 0;
 
 /**
- * OKX API çağrılarını rate-limit'e takılmamak için
- * minimum aralık bırakarak throttle eder.
+ * Tam seri OKX kuyruğu — throttle + HTTP isteğinin tamamını kapsar.
+ * Bir önceki OKX çağrısı (fetch dahil) bitmeden sonraki BAŞLAMAZ.
+ * Promise.all() ile paralel çağrılsa bile istekler %100 sıralı gider.
  */
-async function okxRateThrottle(): Promise<void> {
-  const now = Date.now();
-  const elapsed = now - lastOkxCallTimestamp;
-  if (elapsed < OKX_MIN_CALL_SPACING_MS) {
-    const waitMs = OKX_MIN_CALL_SPACING_MS - elapsed;
-    console.log(`[OKX-RATE] ${waitMs}ms bekleniyor (rate-limit koruması)…`);
-    await new Promise((r) => setTimeout(r, waitMs));
-  }
-  lastOkxCallTimestamp = Date.now();
+let _okxQueueTail: Promise<void> = Promise.resolve();
+
+function enqueueOkxCall<T>(fn: () => Promise<T>): Promise<T> {
+  const job = _okxQueueTail.then(async () => {
+    // Önceki çağrının TAMAMLANMASINDAN bu yana geçen süreyi kontrol et
+    const now = Date.now();
+    const elapsed = now - lastOkxCallTimestamp;
+    if (elapsed < OKX_MIN_CALL_SPACING_MS) {
+      const waitMs = OKX_MIN_CALL_SPACING_MS - elapsed;
+      console.log(`[OKX-RATE] ${waitMs}ms bekleniyor (spacing koruması)…`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    // İsteğin kendisini çalıştır (fetch dahil)
+    const result = await fn();
+    // Timestamp'i çağrı TAMAMLANDIKTAN sonra güncelle
+    lastOkxCallTimestamp = Date.now();
+    return result;
+  });
+  // Kuyruk zincirini güncelle (hata olursa bile sonraki çağrılar devam etsin)
+  _okxQueueTail = job.then(() => {}, () => { lastOkxCallTimestamp = Date.now(); });
+  return job;
 }
 
 /**
@@ -190,60 +203,48 @@ function buildOkxHeaders(method: string, requestPath: string) {
 export async function fetchOkxQuote(
   params: OkxQuoteParams
 ): Promise<{ ctx: OkxQuoteRouterResult; meta: QuoteMeta }> {
-  const cfg = loadConfig();
+  return enqueueOkxCall(async () => {
+    const cfg = loadConfig();
 
-  // Slippage: OKX expects a percentage string (e.g. "0.2" = 0.2%)
-  const slippagePercent = (params.slippageBps / 100).toString();
+    const slippagePercent = (params.slippageBps / 100).toString();
 
-  // Build query string — OKX DEX Aggregator uses GET with query params
-  const qs = new URLSearchParams({
-    chainIndex: "501", // Solana mainnet-beta
-    fromTokenAddress: params.inputMint,
-    toTokenAddress: params.outputMint,
-    amount: params.amount.toString(),
-    slippagePercent,
+    const qs = new URLSearchParams({
+      chainIndex: "501",
+      fromTokenAddress: params.inputMint,
+      toTokenAddress: params.outputMint,
+      amount: params.amount.toString(),
+      slippagePercent,
+    });
+
+    const requestPath = `${OKX_QUOTE_PATH}?${qs.toString()}`;
+    const fullUrl = `${cfg.okxBaseUrl}${requestPath}`;
+
+    const headers = buildOkxHeaders("GET", requestPath);
+    const res = await fetchWithOkx429Retry(fullUrl, headers, "quote");
+
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "(body okunamadı)");
+      throw new Error(`OKX quote failed: ${res.status} ${res.statusText} — ${bodyText}`);
+    }
+
+    const json = (await res.json()) as OkxQuoteResponse;
+    if (json.code !== "0" || !json.data?.length) {
+      throw new Error(`OKX quote error: code=${json.code}, msg=${json.msg}`);
+    }
+
+    const route = json.data[0];
+    const meta: QuoteMeta = {
+      venue: "OKX",
+      inMint: params.inputMint,
+      outMint: params.outputMint,
+      inAmount: params.amount,
+      expectedOut: BigInt(route.toTokenAmount),
+      slippageBps: params.slippageBps,
+      routeContext: route.dexRouterList,
+    };
+
+    return { ctx: route, meta };
   });
-
-  const requestPath = `${OKX_QUOTE_PATH}?${qs.toString()}`;
-  const fullUrl = `${cfg.okxBaseUrl}${requestPath}`;
-  console.log(`[DEBUG] OKX Quote Request URL: ${fullUrl}`);
-
-  // Rate-limit koruması: minimum çağrı aralığını zorla
-  await okxRateThrottle();
-
-  const headers = buildOkxHeaders("GET", requestPath);
-
-  // 429 retry mekanizmalı fetch
-  const res = await fetchWithOkx429Retry(fullUrl, headers, "quote");
-
-  if (!res.ok) {
-    const bodyText = await res.text().catch(() => "(body okunamadı)");
-    console.error(`[ERROR] OKX quote HTTP ${res.status}: ${bodyText}`);
-    throw new Error(
-      `OKX quote failed: ${res.status} ${res.statusText} — ${bodyText}`
-    );
-  }
-
-  const json = (await res.json()) as OkxQuoteResponse;
-  if (json.code !== "0" || !json.data?.length) {
-    console.error(
-      `[ERROR] OKX quote API hatası: code=${json.code}, msg=${json.msg}`
-    );
-    throw new Error(`OKX quote error: code=${json.code}, msg=${json.msg}`);
-  }
-
-  const route = json.data[0];
-  const meta: QuoteMeta = {
-    venue: "OKX",
-    inMint: params.inputMint,
-    outMint: params.outputMint,
-    inAmount: params.amount,
-    expectedOut: BigInt(route.toTokenAmount),
-    slippageBps: params.slippageBps,
-    routeContext: route.dexRouterList,
-  };
-
-  return { ctx: route, meta };
 }
 
 // ── Swap Instruction (Solana-specific) ──────────────────────────────
@@ -255,72 +256,70 @@ export interface OkxSwapResult {
 export async function buildOkxSwap(
   params: OkxSwapParams
 ): Promise<OkxSwapResult> {
-  const cfg = loadConfig();
+  return enqueueOkxCall(async () => {
+    const cfg = loadConfig();
 
-  const slippagePercent = (params.slippageBps / 100).toString();
+    const slippagePercent = (params.slippageBps / 100).toString();
 
-  const qsParams: Record<string, string> = {
-    chainIndex: "501",
-    fromTokenAddress: params.inputMint,
-    toTokenAddress: params.outputMint,
-    amount: params.amount.toString(),
-    slippagePercent,
-    userWalletAddress: params.userPublicKey,
-  };
+    const qsParams: Record<string, string> = {
+      chainIndex: "501",
+      fromTokenAddress: params.inputMint,
+      toTokenAddress: params.outputMint,
+      amount: params.amount.toString(),
+      slippagePercent,
+      userWalletAddress: params.userPublicKey,
+    };
 
-  // Optional: priority fee (dynamic öncelikli, config fallback)
-  const effectiveFee = params.priorityFeeMicroLamports ?? cfg.rpc.priorityFeeMicrolamports;
-  if (effectiveFee != null) {
-    qsParams.computeUnitPrice = effectiveFee.toString();
-  }
+    // Optional: priority fee (dynamic öncelikli, config fallback)
+    const effectiveFee = params.priorityFeeMicroLamports ?? cfg.rpc.priorityFeeMicrolamports;
+    if (effectiveFee != null) {
+      qsParams.computeUnitPrice = effectiveFee.toString();
+    }
 
-  const qs = new URLSearchParams(qsParams);
-  const requestPath = `${OKX_SWAP_INSTRUCTION_PATH}?${qs.toString()}`;
-  const fullUrl = `${cfg.okxBaseUrl}${requestPath}`;
-  console.log(`[DEBUG] OKX Swap-Instruction Request URL: ${fullUrl}`);
+    const qs = new URLSearchParams(qsParams);
+    const requestPath = `${OKX_SWAP_INSTRUCTION_PATH}?${qs.toString()}`;
+    const fullUrl = `${cfg.okxBaseUrl}${requestPath}`;
 
-  // Rate-limit koruması: minimum çağrı aralığını zorla
-  await okxRateThrottle();
+    const headers = buildOkxHeaders("GET", requestPath);
 
-  const headers = buildOkxHeaders("GET", requestPath);
+    // 429 retry mekanizmalı fetch
+    const res = await fetchWithOkx429Retry(fullUrl, headers, "swap-instruction");
 
-  // 429 retry mekanizmalı fetch
-  const res = await fetchWithOkx429Retry(fullUrl, headers, "swap-instruction");
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "(body okunamadı)");
+      console.error(`[ERROR] OKX swap-instruction HTTP ${res.status}: ${bodyText}`);
+      throw new Error(
+        `OKX swap-instruction failed: ${res.status} ${res.statusText} — ${bodyText}`
+      );
+    }
 
-  if (!res.ok) {
-    const bodyText = await res.text().catch(() => "(body okunamadı)");
-    console.error(`[ERROR] OKX swap-instruction HTTP ${res.status}: ${bodyText}`);
-    throw new Error(
-      `OKX swap-instruction failed: ${res.status} ${res.statusText} — ${bodyText}`
-    );
-  }
+    const json = (await res.json()) as OkxSwapInstructionResponse;
+    if (json.code !== "0" || !json.data) {
+      console.error(
+        `[ERROR] OKX swap-instruction API hatası: code=${json.code}, msg=${json.msg}`
+      );
+      throw new Error(
+        `OKX swap-instruction error: code=${json.code}, msg=${json.msg}`
+      );
+    }
 
-  const json = (await res.json()) as OkxSwapInstructionResponse;
-  if (json.code !== "0" || !json.data) {
-    console.error(
-      `[ERROR] OKX swap-instruction API hatası: code=${json.code}, msg=${json.msg}`
-    );
-    throw new Error(
-      `OKX swap-instruction error: code=${json.code}, msg=${json.msg}`
-    );
-  }
+    // Build VersionedTransaction from individual instructions
+    const tx = await assembleOkxTransaction(json.data, params.userPublicKey);
 
-  // Build VersionedTransaction from individual instructions
-  const tx = await assembleOkxTransaction(json.data, params.userPublicKey);
+    // Extract QuoteMeta from swap-instruction routerResult (ayrı quote isteği gereksiz)
+    const routerResult = json.data.routerResult;
+    const meta: QuoteMeta = {
+      venue: "OKX",
+      inMint: params.inputMint,
+      outMint: params.outputMint,
+      inAmount: params.amount,
+      expectedOut: BigInt(routerResult.toTokenAmount),
+      slippageBps: params.slippageBps,
+      routeContext: routerResult.dexRouterList,
+    };
 
-  // Extract QuoteMeta from swap-instruction routerResult (ayrı quote isteği gereksiz)
-  const routerResult = json.data.routerResult;
-  const meta: QuoteMeta = {
-    venue: "OKX",
-    inMint: params.inputMint,
-    outMint: params.outputMint,
-    inAmount: params.amount,
-    expectedOut: BigInt(routerResult.toTokenAmount),
-    slippageBps: params.slippageBps,
-    routeContext: routerResult.dexRouterList,
-  };
-
-  return { tx, meta };
+    return { tx, meta };
+  });
 }
 
 // ── Assemble instructions into VersionedTransaction ─────────────────

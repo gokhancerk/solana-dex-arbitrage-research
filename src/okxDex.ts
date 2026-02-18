@@ -161,6 +161,8 @@ export interface OkxSwapParams {
   amount: bigint;
   slippageBps: number;
   userPublicKey: string;
+  /** Override priority fee (micro-lamports). Dynamic fee from fees.ts */
+  priorityFeeMicroLamports?: number;
 }
 
 // ── HMAC Signature (OKX requires OK-ACCESS-SIGN) ───────────────────
@@ -266,9 +268,10 @@ export async function buildOkxSwap(
     userWalletAddress: params.userPublicKey,
   };
 
-  // Optional: priority fee
-  if (cfg.rpc.priorityFeeMicrolamports != null) {
-    qsParams.computeUnitPrice = cfg.rpc.priorityFeeMicrolamports.toString();
+  // Optional: priority fee (dynamic öncelikli, config fallback)
+  const effectiveFee = params.priorityFeeMicroLamports ?? cfg.rpc.priorityFeeMicrolamports;
+  if (effectiveFee != null) {
+    qsParams.computeUnitPrice = effectiveFee.toString();
   }
 
   const qs = new URLSearchParams(qsParams);

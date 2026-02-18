@@ -43,16 +43,28 @@ export interface AppConfig {
   apiCooldownMs: number;
   /** Minimum milliseconds between consecutive trade executions (cooldown) */
   tradeCooldownMs: number;
+  /** Taranacak token listesi (round-robin) */
+  scanTokens: readonly TokenSymbol[];
+  /** Dinamik priority fee aktif mi */
+  dynamicPriorityFee: boolean;
+  /** Dinamik fee üst sınırı (micro-lamports) */
+  maxPriorityFee: number;
 }
 
-export const DEFAULT_SLIPPAGE_BPS = 20; // 0.2%
+export const DEFAULT_SLIPPAGE_BPS = 10; // 0.1%
 export const DEFAULT_NOTIONAL_CAP = 1000; // USD stable notional
 export const DEFAULT_MAX_RETRIES = 3;
 export const DEFAULT_CIRCUIT_BREAKER = 3;
-export const DEFAULT_MIN_NET_PROFIT_USDC = 0.03 //0.10; // 10 cents (~0.04% on $240)
+export const DEFAULT_MIN_NET_PROFIT_USDC = 0.12; // 12 cents — 2-leg slippage tamponu
 export const DEFAULT_SOL_USDC_RATE = 150; // conservative fallback
-export const DEFAULT_API_COOLDOWN_MS = 2000; // 2 seconds between API calls
-export const DEFAULT_TRADE_COOLDOWN_MS = 4000; // 4 seconds between trades
+export const DEFAULT_API_COOLDOWN_MS = 600; // 600ms — OKX rate-limit'in altında
+export const DEFAULT_TRADE_COOLDOWN_MS = 2000; // 2 seconds between trades
+/** Varsayılan: yalnızca en likit 3 token. Env ile override: SCAN_TOKENS=SOL,WIF,JUP */
+export const DEFAULT_SCAN_TOKENS: readonly TokenSymbol[] = ["SOL", "WIF", "JUP"] as const;
+/** Dinamik priority fee kullanılsın mı? Env: DYNAMIC_PRIORITY_FEE=true */
+export const DEFAULT_DYNAMIC_PRIORITY_FEE = true;
+/** Dinamik fee cap — aşırı fee ödemeyi engeller (micro-lamports) */
+export const DEFAULT_MAX_PRIORITY_FEE = 100_000;
 
 function requireEnv(name: string, optional = false): string | undefined {
   const v = process.env[name];
@@ -114,6 +126,11 @@ export function loadConfig(): AppConfig {
     solUsdcRate: Number(process.env.SOL_USDC_RATE ?? DEFAULT_SOL_USDC_RATE),
     apiCooldownMs: Number(process.env.API_COOLDOWN_MS ?? DEFAULT_API_COOLDOWN_MS),
     tradeCooldownMs: Number(process.env.TRADE_COOLDOWN_MS ?? DEFAULT_TRADE_COOLDOWN_MS),
+    scanTokens: process.env.SCAN_TOKENS
+      ? (process.env.SCAN_TOKENS.split(",").map(s => s.trim()) as TokenSymbol[])
+      : DEFAULT_SCAN_TOKENS,
+    dynamicPriorityFee: (process.env.DYNAMIC_PRIORITY_FEE ?? "true") === "true",
+    maxPriorityFee: Number(process.env.MAX_PRIORITY_FEE ?? DEFAULT_MAX_PRIORITY_FEE),
     tokens
   };
 }

@@ -37,6 +37,15 @@ export interface JupiterSwapParams {
   route: JupiterRouteInfo;
   userPublicKey: PublicKey;
   asLegacy?: boolean;
+  /**
+   * true (default): Jupiter wraps native SOL → wSOL before swap, unwraps after.
+   * false: Jupiter uses existing wSOL token account directly.
+   * Set to false when selling wSOL that already sits in a token account
+   * (e.g. received from OKX Leg 1) to avoid "insufficient lamports" errors.
+   */
+  wrapAndUnwrapSol?: boolean;
+  /** Override priority fee (micro-lamports). Dynamic fee from fees.ts */
+  priorityFeeMicroLamports?: number;
 }
 
 export async function fetchJupiterQuote(params: JupiterQuoteParams): Promise<{ route: JupiterRouteInfo; meta: QuoteMeta }> {
@@ -87,10 +96,10 @@ export async function buildJupiterSwap(params: JupiterSwapParams): Promise<Versi
   const body = {
     quoteResponse: params.route,
     userPublicKey: params.userPublicKey.toBase58(),
-    wrapAndUnwrapSol: true,
+    wrapAndUnwrapSol: params.wrapAndUnwrapSol ?? true,
     asLegacyTransaction: params.asLegacy ?? false,
     useSharedAccounts: true,
-    computeUnitPriceMicroLamports: cfg.rpc.priorityFeeMicrolamports
+    computeUnitPriceMicroLamports: params.priorityFeeMicroLamports ?? cfg.rpc.priorityFeeMicrolamports
   };
 
   const swapHeaders: Record<string, string> = { "content-type": "application/json" };

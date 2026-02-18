@@ -1,6 +1,6 @@
 import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { getConnection, sendVersionedWithOpts } from "./solana.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type TokenSymbol, type TradePair } from "./config.js";
 import { toRaw } from "./tokens.js";
 import {
   Direction,
@@ -61,11 +61,17 @@ export interface NetProfitDecision {
  */
 export interface QuoteEstimate {
   direction: Direction;
+  targetToken: TokenSymbol;
   grossProfitUsdc: number;
   estimatedFeeUsdc: number;
   netProfitUsdc: number;
   /** Whether net profit exceeds the configured minimum threshold */
   viable: boolean;
+}
+
+/** TokenSymbol → TradePair dönüştürü */
+export function pairFromToken(token: TokenSymbol): TradePair {
+  return `${token}/USDC` as TradePair;
 }
 
 /**
@@ -77,40 +83,43 @@ export async function estimateDirectionProfit(params: {
   direction: Direction;
   notionalUsd: number;
   ownerStr: string;
+  /** Hangi token üzerinden arbitraj yapılacak (WIF veya JUP). Varsayılan: WIF */
+  targetToken?: TokenSymbol;
 }): Promise<QuoteEstimate> {
   const cfg = loadConfig();
   enforceNotional(params.notionalUsd, cfg.notionalCapUsd);
 
+  const targetToken: TokenSymbol = params.targetToken ?? "WIF";
   const usdcDecimals = cfg.tokens.USDC.decimals;
   const usdcMint = cfg.tokens.USDC.mint;
-  const solMint = cfg.tokens.SOL.mint;
+  const targetMint = cfg.tokens[targetToken].mint;
   const amountRaw = toRaw(params.notionalUsd, usdcDecimals);
 
   let finalOutRaw: bigint;
 
   if (params.direction === "JUP_TO_OKX") {
-    // Leg 1: Jupiter USDC → SOL
+    // Leg 1: Jupiter USDC → targetToken
     const { meta: jupMeta } = await fetchJupiterQuote({
-      inputMint: usdcMint, outputMint: solMint,
+      inputMint: usdcMint, outputMint: targetMint,
       amount: amountRaw, slippageBps: cfg.slippageBps,
     });
-    // Leg 2: OKX SOL → USDC
+    // Leg 2: OKX targetToken → USDC
     const { meta: okxMeta } = await fetchOkxQuote({
-      inputMint: solMint, outputMint: usdcMint,
+      inputMint: targetMint, outputMint: usdcMint,
       amount: jupMeta.expectedOut, slippageBps: cfg.slippageBps,
       userPublicKey: params.ownerStr,
     });
     finalOutRaw = okxMeta.expectedOut;
   } else {
-    // Leg 1: OKX USDC → SOL
+    // Leg 1: OKX USDC → targetToken
     const { meta: okxMeta } = await fetchOkxQuote({
-      inputMint: usdcMint, outputMint: solMint,
+      inputMint: usdcMint, outputMint: targetMint,
       amount: amountRaw, slippageBps: cfg.slippageBps,
       userPublicKey: params.ownerStr,
     });
-    // Leg 2: Jupiter SOL → USDC
+    // Leg 2: Jupiter targetToken → USDC
     const { meta: jupMeta } = await fetchJupiterQuote({
-      inputMint: solMint, outputMint: usdcMint,
+      inputMint: targetMint, outputMint: usdcMint,
       amount: okxMeta.expectedOut, slippageBps: cfg.slippageBps,
     });
     finalOutRaw = jupMeta.expectedOut;
@@ -124,6 +133,7 @@ export async function estimateDirectionProfit(params: {
 
   return {
     direction: params.direction,
+    targetToken,
     grossProfitUsdc,
     estimatedFeeUsdc: estFeeUsdc,
     netProfitUsdc,
@@ -135,6 +145,8 @@ interface BuildParams {
   direction: Direction;
   notionalUsd: number; // USDC notionals
   owner: PublicKey;
+  /** Hangi token üzerinden arbitraj: WIF veya JUP. Varsayılan: WIF */
+  targetToken?: TokenSymbol;
   /** When true, simulation errors are logged as warnings instead of throwing */
   dryRun?: boolean;
 }
@@ -216,12 +228,13 @@ async function simulateLegSafe(leg: SimulatedLeg, venue: "JUPITER" | "OKX", dryR
 
 export async function buildAndSimulate(params: BuildParams): Promise<BuildSimulateResult> {
   const cfg = loadConfig();
-  console.log(`[DEBUG] buildAndSimulate başladı — direction=${params.direction}, notional=${params.notionalUsd}`);
+  const targetToken: TokenSymbol = params.targetToken ?? "WIF";
+  console.log(`[DEBUG] buildAndSimulate başladı — direction=${params.direction}, targetToken=${targetToken}, notional=${params.notionalUsd}`);
   enforceNotional(params.notionalUsd, cfg.notionalCapUsd);
 
   const usdcDecimals = cfg.tokens.USDC.decimals;
   const usdcMint = cfg.tokens.USDC.mint;
-  const solMint = cfg.tokens.SOL.mint;
+  const targetMint = cfg.tokens[targetToken].mint;
 
   const amountRaw = toRaw(params.notionalUsd, usdcDecimals);
   const ownerStr = params.owner.toBase58();
@@ -231,11 +244,11 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
   const quoteMeta = [] as BuildSimulateResult["quoteMeta"];
 
   if (params.direction === "JUP_TO_OKX") {
-    console.log("[DEBUG] Leg 1/2 — Jupiter quote isteniyor...");
+    console.log(`[DEBUG] Leg 1/2 — Jupiter quote isteniyor (USDC→${targetToken})...`);
     const t0 = Date.now();
     const { route, meta } = await fetchJupiterQuote({
       inputMint: usdcMint,
-      outputMint: solMint,
+      outputMint: targetMint,
       amount: amountRaw,
       slippageBps: cfg.slippageBps
     });
@@ -250,7 +263,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     const jupLeg: SimulatedLeg = {
       venue: "JUPITER",
       tx: jupTx,
-      outMint: solMint,
+      outMint: targetMint,
       owner: ownerStr,
       expectedOut: meta.expectedOut,
       simulatedOut: meta.expectedOut,
@@ -262,10 +275,10 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(jupLeg, "JUPITER", params.dryRun ?? false));
     console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t2}ms)`);
 
-    console.log("[DEBUG] Leg 2/2 — OKX quote isteniyor (rate-throttle aktif)...");
+    console.log(`[DEBUG] Leg 2/2 — OKX quote isteniyor (${targetToken}→USDC, rate-throttle aktif)...`);
     const t3 = Date.now();
     const { ctx, meta: okxMeta } = await fetchOkxQuote({
-      inputMint: solMint,
+      inputMint: targetMint,
       outputMint: usdcMint,
       amount: meta.expectedOut,
       slippageBps: cfg.slippageBps,
@@ -277,7 +290,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     console.log("[DEBUG] OKX swap TX oluşturuluyor...");
     const t4 = Date.now();
     const okxTx = await buildOkxSwap({
-      inputMint: solMint,
+      inputMint: targetMint,
       outputMint: usdcMint,
       amount: meta.expectedOut,
       slippageBps: cfg.slippageBps,
@@ -300,11 +313,11 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
     console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t5}ms)`);
   } else {
-    console.log("[DEBUG] Leg 1/2 — OKX quote isteniyor (rate-throttle aktif)...");
+    console.log(`[DEBUG] Leg 1/2 — OKX quote isteniyor (USDC→${targetToken}, rate-throttle aktif)...`);
     const t0 = Date.now();
     const { ctx, meta } = await fetchOkxQuote({
       inputMint: usdcMint,
-      outputMint: solMint,
+      outputMint: targetMint,
       amount: amountRaw,
       slippageBps: cfg.slippageBps,
       userPublicKey: ownerStr
@@ -316,7 +329,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     const t1 = Date.now();
     const okxTx = await buildOkxSwap({
       inputMint: usdcMint,
-      outputMint: solMint,
+      outputMint: targetMint,
       amount: amountRaw,
       slippageBps: cfg.slippageBps,
       userPublicKey: ownerStr,
@@ -326,7 +339,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     const okxLeg: SimulatedLeg = {
       venue: "OKX",
       tx: okxTx,
-      outMint: solMint,
+      outMint: targetMint,
       owner: ownerStr,
       expectedOut: meta.expectedOut,
       simulatedOut: meta.expectedOut,
@@ -338,10 +351,10 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
     console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t2}ms)`);
 
-    console.log("[DEBUG] Leg 2/2 — Jupiter quote isteniyor...");
+    console.log(`[DEBUG] Leg 2/2 — Jupiter quote isteniyor (${targetToken}→USDC)...`);
     const t3 = Date.now();
     const { route, meta: jupMeta } = await fetchJupiterQuote({
-      inputMint: solMint,
+      inputMint: targetMint,
       outputMint: usdcMint,
       amount: meta.expectedOut,
       slippageBps: cfg.slippageBps
@@ -424,7 +437,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
   if (!approved) {
     const failReason = `Net kâr (${netProfitUsdc.toFixed(6)} USDC) minimum eşiğin (${cfg.minNetProfitUsdc} USDC) altında — işlem iptal edildi`;
-    const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: false, failReason, status: "REJECTED_LOW_PROFIT", netProfit });
+    const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: false, failReason, status: "REJECTED_LOW_PROFIT", netProfit });
     appendTradeLog(tel);
     throw new NetProfitRejectedError(failReason, netProfit);
   }
@@ -432,7 +445,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
   // ───── Onaylandı → telemetri kaydet & return ─────
   const hasSimErrors = legs.some(l => l.simulation.error);
   const finalStatus: TelemetryStatus = (hasSimErrors && params.dryRun) ? "DRY_RUN_PROFITABLE" : "SIMULATION_SUCCESS";
-  const tel = buildTelemetry({ build: partialResult, direction: params.direction, success: !hasSimErrors, status: finalStatus, netProfit,
+  const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: !hasSimErrors, status: finalStatus, netProfit,
     failReason: hasSimErrors ? legs.filter(l => l.simulation.error).map(l => `${l.venue}: ${l.simulation.error}`).join('; ') : undefined });
   appendTradeLog(tel);
 

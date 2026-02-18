@@ -5,12 +5,13 @@ import {
   buildAndSimulate,
   sendWithRetry,
   estimateDirectionProfit,
+  pairFromToken,
   QuoteEstimate,
 } from "../execution.js";
 import { buildTelemetry, appendTradeLog } from "../telemetry.js";
 import { Keypair } from "@solana/web3.js";
 import { getKeypairFromEnv } from "../wallet.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, SCANNABLE_TOKENS, type TokenSymbol, type TradePair } from "../config.js";
 import { tradeLock } from "../tradeLock.js";
 
 /** Her döngüde taranacak iki yön */
@@ -22,10 +23,14 @@ function dirLabel(d: Direction): string {
 }
 
 /**
- * Bi-directional PriceTicker — Event-driven driver.
+ * Bi-directional PriceTicker — Round-Robin multi-token driver.
  *
- * Her uygun slot'ta iki yönü ardışık (staggered) olarak tarar,
- * OKX rate-limit'ine (429) çarpmamak için araya STAGGER_DELAY_MS bırakır.
+ * Her tick'te yalnızca BİR token çifti taranır (rate-limit koruması):
+ *   Tick 1: WIF/USDC (iki yön)
+ *   Tick 2: JUP/USDC (iki yön)
+ *   Tick 3: WIF/USDC …
+ *
+ * Bu yaklaşım OKX 429 rate-limit'e çarpmayı engeller.
  * En kârlı rotayı seçer, tam build+simulate+send yapar.
  * Global tradeLock her iki yönü de kapsar; aynı anda sadece bir işlem çalışır.
  */
@@ -45,6 +50,12 @@ export class PriceTicker {
   private readonly staggerDelayMs: number;
 
   /**
+   * Round-Robin index — hangi token'ın sırada olduğunu takip eder.
+   * Her başarılı tick'ten sonra bir sonraki token'a geçer.
+   */
+  private roundRobinIndex = 0;
+
+  /**
    * TRADE_AMOUNT_USDC env değişkeninden dinamik olarak okunur.
    * Her tick'te güncel değeri alır; tanımsızsa varsayılan 1 USDC kullanılır.
    */
@@ -60,6 +71,16 @@ export class PriceTicker {
     return val;
   }
 
+  /** Round-Robin sırasındaki mevcut target token */
+  private get currentToken(): TokenSymbol {
+    return SCANNABLE_TOKENS[this.roundRobinIndex % SCANNABLE_TOKENS.length];
+  }
+
+  /** Round-Robin'i bir sonraki token'a ilerlet */
+  private advanceRoundRobin(): void {
+    this.roundRobinIndex = (this.roundRobinIndex + 1) % SCANNABLE_TOKENS.length;
+  }
+
   constructor(params: { slotsPerCheck?: number }) {
     this.slotDriver = new SlotDriver();
     this.slotsPerCheck = params.slotsPerCheck ?? 4;
@@ -70,8 +91,9 @@ export class PriceTicker {
 
   start() {
     console.log(
-      `[PriceTicker] Çift yönlü (bi-directional) tarama aktif — ` +
-        `her tick'te JUP↔OKX staggered quote (delay=${this.staggerDelayMs}ms)`
+      `[PriceTicker] Round-Robin çoklu-token tarama aktif — ` +
+        `tokenlar=[${SCANNABLE_TOKENS.join(", ")}], ` +
+        `her tick'te tek token, çift yönlü (delay=${this.staggerDelayMs}ms)`
     );
     this.slotDriver.start();
 
@@ -98,16 +120,20 @@ export class PriceTicker {
       }
 
       const startMs = performance.now();
+      const targetToken = this.currentToken;
+      const pair: TradePair = pairFromToken(targetToken);
+
       try {
         const ownerStr = this.owner.publicKey.toBase58();
         const notional = this.notionalUsd;
 
         // ╔══════════════════════════════════════════════════════════════╗
-        // ║  ADIM 1 — Staggered quote: iki yönü ardışık tara           ║
-        // ║  OKX 429 rate-limit'ini önlemek için araya delay koyuyoruz  ║
+        // ║  ADIM 1 — Round-Robin: bu tick'te tek token, iki yön tara  ║
+        // ║  OKX 429 rate-limit'ini önlemek için tokenlar sıralı döner ║
         // ╚══════════════════════════════════════════════════════════════╝
         console.log(
-          `[SCAN] Slot ${slot} — iki yön staggered quote başlatılıyor (${notional} USDC, delay=${this.staggerDelayMs}ms)…`
+          `[SCAN] Slot ${slot} — ${pair} çift yönlü quote başlatılıyor ` +
+            `(${notional} USDC, delay=${this.staggerDelayMs}ms)…`
         );
 
         const viable: QuoteEstimate[] = [];
@@ -122,9 +148,10 @@ export class PriceTicker {
               direction: dir,
               notionalUsd: notional,
               ownerStr,
+              targetToken,
             });
             console.log(
-              `[SCAN][${dirLabel(dir)}] Brüt: ${q.grossProfitUsdc.toFixed(6)} USDC | ` +
+              `[SCAN][${pair}][${dirLabel(dir)}] Brüt: ${q.grossProfitUsdc.toFixed(6)} USDC | ` +
                 `Fee: ${q.estimatedFeeUsdc.toFixed(6)} USDC | ` +
                 `Net: ${q.netProfitUsdc.toFixed(6)} USDC ` +
                 (q.viable ? "✓ VİABLE" : "✗ düşük")
@@ -132,13 +159,13 @@ export class PriceTicker {
             if (q.viable) viable.push(q);
           } catch (err) {
             const reason = err instanceof Error ? err.message : String(err);
-            console.warn(`[SCAN][${dirLabel(dir)}] Quote hatası: ${reason}`);
+            console.warn(`[SCAN][${pair}][${dirLabel(dir)}] Quote hatası: ${reason}`);
           }
         }
 
         if (viable.length === 0) {
           console.log(
-            `[SCAN] Slot ${slot} — her iki yönde de kârlı rota yok, atlanıyor`
+            `[SCAN] Slot ${slot} — ${pair} her iki yönde de kârlı rota yok, atlanıyor`
           );
           return;
         }
@@ -150,7 +177,7 @@ export class PriceTicker {
           a.netProfitUsdc >= b.netProfitUsdc ? a : b
         );
         console.log(
-          `[SCAN] ★ Kazanan rota: ${dirLabel(best.direction)} — ` +
+          `[SCAN] ★ Kazanan rota: ${pair} ${dirLabel(best.direction)} — ` +
             `Tahmini net kâr: ${best.netProfitUsdc.toFixed(6)} USDC`
         );
 
@@ -161,6 +188,7 @@ export class PriceTicker {
           direction: best.direction,
           notionalUsd: notional,
           owner: this.owner.publicKey,
+          targetToken,
           dryRun: false,
         });
 
@@ -168,7 +196,7 @@ export class PriceTicker {
         // ║  ADIM 4 — LIVE: İşlemi zincire gönder                     ║
         // ╚══════════════════════════════════════════════════════════════╝
         console.log(
-          `[LIVE][${dirLabel(best.direction)}] Net kâr onaylandı ` +
+          `[LIVE][${pair}][${dirLabel(best.direction)}] Net kâr onaylandı ` +
             `(${result.netProfit.netProfitUsdc.toFixed(6)} USDC) — ` +
             `${result.legs.length} leg gönderiliyor…`
         );
@@ -176,14 +204,14 @@ export class PriceTicker {
         const signatures: string[] = [];
         for (const [idx, leg] of result.legs.entries()) {
           console.log(
-            `[LIVE][${dirLabel(best.direction)}] Leg ${idx + 1}/${result.legs.length} ` +
+            `[LIVE][${pair}][${dirLabel(best.direction)}] Leg ${idx + 1}/${result.legs.length} ` +
               `(${leg.venue}) gönderiliyor…`
           );
           const sendResult = await sendWithRetry(leg.tx, this.owner);
           if (sendResult.finalSignature) {
             signatures.push(sendResult.finalSignature);
             console.log(
-              `[LIVE][${dirLabel(best.direction)}] Leg ${idx + 1} başarılı ✓ ` +
+              `[LIVE][${pair}][${dirLabel(best.direction)}] Leg ${idx + 1} başarılı ✓ ` +
                 `sig=${sendResult.finalSignature}`
             );
           }
@@ -193,6 +221,7 @@ export class PriceTicker {
         const tel = buildTelemetry({
           build: result,
           direction: best.direction,
+          targetToken,
           sendSignatures: signatures,
           success: true,
           status: "SEND_SUCCESS",
@@ -200,22 +229,25 @@ export class PriceTicker {
         });
         appendTradeLog(tel);
         console.log(
-          `[LIVE][${dirLabel(best.direction)}] Tüm leg'ler gönderildi ✓ ` +
+          `[LIVE][${pair}][${dirLabel(best.direction)}] Tüm leg'ler gönderildi ✓ ` +
             `signatures=[${signatures.join(", ")}]`
         );
       } catch (e) {
         if (e instanceof SendError) {
-          console.error(`[LIVE][SEND_FAILED] ${e.message}`);
+          console.error(`[LIVE][${pair}][SEND_FAILED] ${e.message}`);
         } else {
           // Quote/slippage/sim/net profit hataları execution.ts tarafından telemetri yazılır
-          console.warn("[PriceTicker] error:", e);
+          console.warn(`[PriceTicker][${pair}] error:`, e);
         }
       } finally {
+        // Round-Robin: bu tick tamamlandı, sıradaki token'a geç
+        this.advanceRoundRobin();
         tradeLock.release();
         const endMs = performance.now();
         const latencyMs = Math.round(endMs - startMs);
         console.info(
-          `[LATENCY] Slot: ${slot} | E2E Bi-Directional Cycle: ${latencyMs}ms`
+          `[LATENCY] Slot: ${slot} | Pair: ${pair} | E2E Cycle: ${latencyMs}ms | ` +
+            `Sonraki: ${pairFromToken(this.currentToken)}`
         );
       }
     });

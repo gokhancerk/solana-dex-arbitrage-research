@@ -6,6 +6,7 @@ import { Direction, NetProfitRejectedError, SimulationError, SlippageError, Limi
 import { measureAllEndpoints, printLatencyReport } from "./latency.js";
 import { buildTelemetry, appendTradeLog } from "./telemetry.js";
 import { startServer } from "./server.js";
+import type { TokenSymbol } from "./config.js";
 
 function errorToStatus(err: unknown): TelemetryStatus {
   if (err instanceof NetProfitRejectedError) return "REJECTED_LOW_PROFIT";
@@ -38,10 +39,11 @@ async function main() {
   // ── 2) Build + Simulate (swap dry-run) ────────────────────────────
   const direction = (process.env.DIRECTION as Direction) ?? "JUP_TO_OKX";
   const notional = Number(process.env.NOTIONAL_USD ?? 1);
+  const targetToken = (process.env.TARGET_TOKEN as TokenSymbol) ?? "WIF";
 
-  console.log(`\n═══ Swap Dry-Run: direction=${direction} notional=${notional} ═══\n`);
+  console.log(`\n═══ Swap Dry-Run: direction=${direction} targetToken=${targetToken} notional=${notional} ═══\n`);
   try {
-    const result = await buildAndSimulate({ direction, notionalUsd: notional, owner: owner.publicKey, dryRun: true });
+    const result = await buildAndSimulate({ direction, notionalUsd: notional, owner: owner.publicKey, targetToken, dryRun: true });
 
     console.log(`\n╔══════════════════════════════════════════════════════════╗`);
     console.log(`║  Dry-Run Sonuçları                                      ║`);
@@ -77,6 +79,7 @@ async function main() {
     const telemetry = buildTelemetry({
       build: result,
       direction,
+      targetToken,
       success: true,
       status: "SIMULATION_SUCCESS",
       netProfit: result.netProfit,
@@ -91,6 +94,7 @@ async function main() {
     // ── Telemetri kaydı (başarısız) — appendTradeLog içinde filtrelenir ──
     const telemetry = buildTelemetry({
       direction,
+      targetToken,
       success: false,
       failReason,
       status,

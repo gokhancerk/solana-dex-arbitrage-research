@@ -190,6 +190,7 @@ export class PriceTicker {
           owner: this.owner.publicKey,
           targetToken,
           dryRun: false,
+          cachedEstimate: best,
         });
 
         // ╔══════════════════════════════════════════════════════════════╗

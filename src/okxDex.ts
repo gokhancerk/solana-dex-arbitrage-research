@@ -245,9 +245,14 @@ export async function fetchOkxQuote(
 }
 
 // ── Swap Instruction (Solana-specific) ──────────────────────────────
+export interface OkxSwapResult {
+  tx: VersionedTransaction;
+  meta: QuoteMeta;
+}
+
 export async function buildOkxSwap(
   params: OkxSwapParams
-): Promise<VersionedTransaction> {
+): Promise<OkxSwapResult> {
   const cfg = loadConfig();
 
   const slippagePercent = (params.slippageBps / 100).toString();
@@ -298,7 +303,21 @@ export async function buildOkxSwap(
   }
 
   // Build VersionedTransaction from individual instructions
-  return assembleOkxTransaction(json.data, params.userPublicKey);
+  const tx = await assembleOkxTransaction(json.data, params.userPublicKey);
+
+  // Extract QuoteMeta from swap-instruction routerResult (ayrı quote isteği gereksiz)
+  const routerResult = json.data.routerResult;
+  const meta: QuoteMeta = {
+    venue: "OKX",
+    inMint: params.inputMint,
+    outMint: params.outputMint,
+    inAmount: params.amount,
+    expectedOut: BigInt(routerResult.toTokenAmount),
+    slippageBps: params.slippageBps,
+    routeContext: routerResult.dexRouterList,
+  };
+
+  return { tx, meta };
 }
 
 // ── Assemble instructions into VersionedTransaction ─────────────────

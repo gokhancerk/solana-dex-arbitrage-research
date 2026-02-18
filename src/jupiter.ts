@@ -6,7 +6,7 @@ import { simulateTx } from "./solana.js";
 const JUP_QUOTE_URL = "https://api.jup.ag/swap/v1/quote";
 const JUP_SWAP_URL = "https://api.jup.ag/swap/v1/swap";
 
-interface JupiterRouteInfo {
+export interface JupiterRouteInfo {
   inputMint: string;
   inAmount: string;
   outputMint: string;

@@ -14,9 +14,10 @@ import {
   SendError,
   NetProfitRejectedError,
   NetProfitInfo,
-  TelemetryStatus
+  TelemetryStatus,
+  QuoteMeta
 } from "./types.js";
-import { fetchJupiterQuote, buildJupiterSwap, computeSlippageBps, simulateJupiterTx } from "./jupiter.js";
+import { fetchJupiterQuote, buildJupiterSwap, computeSlippageBps, simulateJupiterTx, type JupiterRouteInfo } from "./jupiter.js";
 import { fetchOkxQuote, buildOkxSwap, simulateOkxTx } from "./okxDex.js";
 import { buildTelemetry, appendTradeLog } from "./telemetry.js";
 
@@ -67,6 +68,12 @@ export interface QuoteEstimate {
   netProfitUsdc: number;
   /** Whether net profit exceeds the configured minimum threshold */
   viable: boolean;
+  /** Cached Jupiter route for reuse in buildAndSimulate (avoids duplicate API call) */
+  _cachedJupRoute?: JupiterRouteInfo;
+  /** Cached Jupiter quote meta */
+  _cachedJupMeta?: QuoteMeta;
+  /** Cached OKX quote meta */
+  _cachedOkxMeta?: QuoteMeta;
 }
 
 /** TokenSymbol → TradePair dönüştürü */
@@ -96,19 +103,25 @@ export async function estimateDirectionProfit(params: {
   const amountRaw = toRaw(params.notionalUsd, usdcDecimals);
 
   let finalOutRaw: bigint;
+  let _cachedJupRoute: JupiterRouteInfo | undefined;
+  let _cachedJupMeta: QuoteMeta | undefined;
+  let _cachedOkxMeta: QuoteMeta | undefined;
 
   if (params.direction === "JUP_TO_OKX") {
     // Leg 1: Jupiter USDC → targetToken
-    const { meta: jupMeta } = await fetchJupiterQuote({
+    const { route, meta: jupMeta } = await fetchJupiterQuote({
       inputMint: usdcMint, outputMint: targetMint,
       amount: amountRaw, slippageBps: cfg.slippageBps,
     });
+    _cachedJupRoute = route;
+    _cachedJupMeta = jupMeta;
     // Leg 2: OKX targetToken → USDC
     const { meta: okxMeta } = await fetchOkxQuote({
       inputMint: targetMint, outputMint: usdcMint,
       amount: jupMeta.expectedOut, slippageBps: cfg.slippageBps,
       userPublicKey: params.ownerStr,
     });
+    _cachedOkxMeta = okxMeta;
     finalOutRaw = okxMeta.expectedOut;
   } else {
     // Leg 1: OKX USDC → targetToken
@@ -117,11 +130,14 @@ export async function estimateDirectionProfit(params: {
       amount: amountRaw, slippageBps: cfg.slippageBps,
       userPublicKey: params.ownerStr,
     });
+    _cachedOkxMeta = okxMeta;
     // Leg 2: Jupiter targetToken → USDC
-    const { meta: jupMeta } = await fetchJupiterQuote({
+    const { route, meta: jupMeta } = await fetchJupiterQuote({
       inputMint: targetMint, outputMint: usdcMint,
       amount: okxMeta.expectedOut, slippageBps: cfg.slippageBps,
     });
+    _cachedJupRoute = route;
+    _cachedJupMeta = jupMeta;
     finalOutRaw = jupMeta.expectedOut;
   }
 
@@ -138,6 +154,9 @@ export async function estimateDirectionProfit(params: {
     estimatedFeeUsdc: estFeeUsdc,
     netProfitUsdc,
     viable: netProfitUsdc >= cfg.minNetProfitUsdc,
+    _cachedJupRoute,
+    _cachedJupMeta,
+    _cachedOkxMeta,
   };
 }
 
@@ -149,6 +168,8 @@ interface BuildParams {
   targetToken?: TokenSymbol;
   /** When true, simulation errors are logged as warnings instead of throwing */
   dryRun?: boolean;
+  /** Pre-fetched estimate — skips redundant quote API calls in buildAndSimulate */
+  cachedEstimate?: QuoteEstimate;
 }
 
 function enforceNotional(notional: number, cap: number) {
@@ -244,7 +265,9 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
   const quoteMeta = [] as BuildSimulateResult["quoteMeta"];
 
   if (params.direction === "JUP_TO_OKX") {
-    console.log(`[DEBUG] Leg 1/2 — Jupiter quote isteniyor (USDC→${targetToken})...`);
+    // ── Leg 1: Jupiter USDC → targetToken (█ HER ZAMAN TAZE QUOTE █) ──
+    // Stale quote → stale otherAmountThreshold → Custom:1 sim hatasını önler
+    console.log(`[FRESH] Leg 1/2 — Jupiter TAZE quote isteniyor (USDC→${targetToken})...`);
     const t0 = Date.now();
     const { route, meta } = await fetchJupiterQuote({
       inputMint: usdcMint,
@@ -252,7 +275,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       amount: amountRaw,
       slippageBps: cfg.slippageBps
     });
-    console.log(`[DEBUG] Jupiter quote alındı (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
+    console.log(`[FRESH] Jupiter quote alındı (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
     quoteMeta.push(meta);
 
     console.log("[DEBUG] Jupiter swap TX oluşturuluyor...");
@@ -275,28 +298,18 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(jupLeg, "JUPITER", params.dryRun ?? false));
     console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t2}ms)`);
 
-    console.log(`[DEBUG] Leg 2/2 — OKX quote isteniyor (${targetToken}→USDC, rate-throttle aktif)...`);
-    const t3 = Date.now();
-    const { ctx, meta: okxMeta } = await fetchOkxQuote({
-      inputMint: targetMint,
-      outputMint: usdcMint,
-      amount: meta.expectedOut,
-      slippageBps: cfg.slippageBps,
-      userPublicKey: ownerStr
-    });
-    console.log(`[DEBUG] OKX quote alındı (${Date.now() - t3}ms) — expectedOut=${okxMeta.expectedOut.toString()}`);
-    quoteMeta.push(okxMeta);
-
-    console.log("[DEBUG] OKX swap TX oluşturuluyor...");
+    // ── Leg 2: OKX targetToken → USDC (swap-instruction'dan meta alır — ayrı quote gereksiz) ──
+    console.log(`[DEBUG] Leg 2/2 — OKX swap-instruction isteniyor (${targetToken}→USDC)...`);
     const t4 = Date.now();
-    const okxTx = await buildOkxSwap({
+    const { tx: okxTx, meta: okxMeta } = await buildOkxSwap({
       inputMint: targetMint,
       outputMint: usdcMint,
       amount: meta.expectedOut,
       slippageBps: cfg.slippageBps,
       userPublicKey: ownerStr,
     });
-    console.log(`[DEBUG] OKX swap TX hazır (${Date.now() - t4}ms)`);
+    console.log(`[DEBUG] OKX swap TX + meta hazır (${Date.now() - t4}ms) — expectedOut=${okxMeta.expectedOut.toString()}`);
+    quoteMeta.push(okxMeta);
 
     const okxLeg: SimulatedLeg = {
       venue: "OKX",
@@ -313,28 +326,20 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
     console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t5}ms)`);
   } else {
-    console.log(`[DEBUG] Leg 1/2 — OKX quote isteniyor (USDC→${targetToken}, rate-throttle aktif)...`);
+    // ── Leg 1: OKX USDC → targetToken (swap-instruction'dan meta alır) ──
+    // Cache'deki OKX miktarını kullanarak swap-instruction çağrırız.
+    // swap-instruction response'u zaten taze routing + meta içerir.
+    console.log(`[DEBUG] Leg 1/2 — OKX swap-instruction isteniyor (USDC→${targetToken})...`);
     const t0 = Date.now();
-    const { ctx, meta } = await fetchOkxQuote({
-      inputMint: usdcMint,
-      outputMint: targetMint,
-      amount: amountRaw,
-      slippageBps: cfg.slippageBps,
-      userPublicKey: ownerStr
-    });
-    console.log(`[DEBUG] OKX quote alındı (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
-    quoteMeta.push(meta);
-
-    console.log("[DEBUG] OKX swap TX oluşturuluyor...");
-    const t1 = Date.now();
-    const okxTx = await buildOkxSwap({
+    const { tx: okxTx, meta } = await buildOkxSwap({
       inputMint: usdcMint,
       outputMint: targetMint,
       amount: amountRaw,
       slippageBps: cfg.slippageBps,
       userPublicKey: ownerStr,
     });
-    console.log(`[DEBUG] OKX swap TX hazır (${Date.now() - t1}ms)`);
+    console.log(`[DEBUG] OKX swap TX + meta hazır (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
+    quoteMeta.push(meta);
 
     const okxLeg: SimulatedLeg = {
       venue: "OKX",
@@ -351,7 +356,9 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
     console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t2}ms)`);
 
-    console.log(`[DEBUG] Leg 2/2 — Jupiter quote isteniyor (${targetToken}→USDC)...`);
+    // ── Leg 2: Jupiter targetToken → USDC (█ HER ZAMAN TAZE QUOTE █) ──
+    // Stale quote → stale otherAmountThreshold → Custom:1 sim hatasını önler
+    console.log(`[FRESH] Leg 2/2 — Jupiter TAZE quote isteniyor (${targetToken}→USDC)...`);
     const t3 = Date.now();
     const { route, meta: jupMeta } = await fetchJupiterQuote({
       inputMint: targetMint,
@@ -359,7 +366,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       amount: meta.expectedOut,
       slippageBps: cfg.slippageBps
     });
-    console.log(`[DEBUG] Jupiter quote alındı (${Date.now() - t3}ms) — expectedOut=${jupMeta.expectedOut.toString()}`);
+    console.log(`[FRESH] Jupiter quote alındı (${Date.now() - t3}ms) — expectedOut=${jupMeta.expectedOut.toString()}`);
     quoteMeta.push(jupMeta);
 
     console.log("[DEBUG] Jupiter swap TX oluşturuluyor...");

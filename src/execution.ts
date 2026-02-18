@@ -321,10 +321,11 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       simulation: { logs: [] }
     };
 
-    console.log("[DEBUG] OKX TX simüle ediliyor...");
-    const t5 = Date.now();
-    legs.push(await simulateLegSafe(okxLeg, "OKX", params.dryRun ?? false));
-    console.log(`[DEBUG] OKX simülasyon tamamlandı (${Date.now() - t5}ms)`);
+    // Leg 2 simülasyonu ATLANIR: Cüzdan henüz Leg 1'i göndermediği için
+    // targetToken bakiyesi yok → simülasyon her zaman Custom:1 fırlatır.
+    // On-chain slippage koruması (otherAmountThreshold) zaten aktif.
+    console.log(`[SKIP-SIM] Leg 2/2 (${okxLeg.venue}) simülasyon atlandı — Leg 1 henüz zincirde değil, quote'a güveniliyor`);
+    legs.push(okxLeg);
   } else {
     // ── Leg 1: OKX USDC → targetToken (swap-instruction'dan meta alır) ──
     // Cache'deki OKX miktarını kullanarak swap-instruction çağrırız.
@@ -384,10 +385,11 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
       simulation: { logs: [] }
     };
 
-    console.log("[DEBUG] Jupiter TX simüle ediliyor...");
-    const t5 = Date.now();
-    legs.push(await simulateLegSafe(jupLeg, "JUPITER", params.dryRun ?? false));
-    console.log(`[DEBUG] Jupiter simülasyon tamamlandı (${Date.now() - t5}ms)`);
+    // Leg 2 simülasyonu ATLANIR: Cüzdan henüz Leg 1'i göndermediği için
+    // targetToken bakiyesi yok → simülasyon her zaman Custom:1 fırlatır.
+    // On-chain slippage koruması (otherAmountThreshold) zaten aktif.
+    console.log(`[SKIP-SIM] Leg 2/2 (${jupLeg.venue}) simülasyon atlandı — Leg 1 henüz zincirde değil, quote'a güveniliyor`);
+    legs.push(jupLeg);
   }
 
   // ───── Net Profit hesabı (tüm kod yollarında telemetri için ÖNCE hesapla) ─────

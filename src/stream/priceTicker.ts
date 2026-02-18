@@ -10,6 +10,7 @@ import {
   buildFreshLeg2,
   emergencyUnwind,
   resolvePriorityFee,
+  executeAtomicArbitrage,
 } from "../execution.js";
 import { buildTelemetry, appendTradeLog } from "../telemetry.js";
 import { Keypair } from "@solana/web3.js";
@@ -18,6 +19,7 @@ import { loadConfig, type TokenSymbol, type TradePair } from "../config.js";
 import { tradeLock } from "../tradeLock.js";
 import { waitForConfirmation } from "../solana.js";
 import { takeBalanceSnapshot, computeRealizedPnl, type RealizedPnl } from "../balanceSnapshot.js";
+import { isJitoAvailable, getJitoCooldownRemaining } from "../jito.js";
 
 /** Her döngüde taranacak iki yön */
 const DIRECTIONS: readonly Direction[] = ["JUP_TO_OKX", "OKX_TO_JUP"] as const;
@@ -101,7 +103,10 @@ export class PriceTicker {
     console.log(
       `[PriceTicker] Round-Robin çoklu-token tarama aktif — ` +
         `tokenlar=[${this.scanTokens.join(", ")}], ` +
-        `her tick'te tek token, çift yönlü PARALEL`
+        `her tick'te tek token, çift yönlü PARALEL` +
+        (loadConfig().useJitoBundle
+          ? ` | ★ JITO BUNDLE AKTİF (atomik çalışma)`
+          : ` | Sequential mod (Leg1→confirm→Leg2)`)
     );
     this.slotDriver.start();
 
@@ -173,12 +178,32 @@ export class PriceTicker {
         });
 
         const results = await Promise.all(quotePromises);
-        const viable = results.filter((q): q is QuoteEstimate => q !== null && q.viable);
+
+        // ── SPREAD BUFFER: Estimate aşamasında 1.5x min profit gerekli ──
+        // Tahmini kâr her zaman gerçek kârdan ~50% daha iyi çıkıyor (MEV, fiyat kayması).
+        // Bu buffer, sadece yeterince geniş spread'lerde trade eden bir filtre ekler.
+        const SPREAD_BUFFER = 1.5;
+        const effectiveMinProfit = loadConfig().minNetProfitUsdc * SPREAD_BUFFER;
+        const viable = results.filter(
+          (q): q is QuoteEstimate => q !== null && q.netProfitUsdc >= effectiveMinProfit
+        );
 
         if (viable.length === 0) {
-          console.log(
-            `[SCAN] Slot ${slot} — ${pair} her iki yönde de kârlı rota yok, atlanıyor`
+          // Orijinal viable kontrolü (buffer'sız) ile karşılaştır — bilgilendirme logu
+          const marginal = results.filter(
+            (q): q is QuoteEstimate => q !== null && q.viable
           );
+          if (marginal.length > 0) {
+            const best = marginal.reduce((a, b) => a.netProfitUsdc >= b.netProfitUsdc ? a : b);
+            console.log(
+              `[SCAN] Slot ${slot} — ${pair} spread buffer altında ` +
+                `(en iyi: ${best.netProfitUsdc.toFixed(6)} USDC < buffer: ${effectiveMinProfit.toFixed(4)} USDC), atlanıyor`
+            );
+          } else {
+            console.log(
+              `[SCAN] Slot ${slot} — ${pair} her iki yönde de kârlı rota yok, atlanıyor`
+            );
+          }
           return;
         }
 
@@ -196,7 +221,7 @@ export class PriceTicker {
         // ╔══════════════════════════════════════════════════════════════╗
         // ║  ADIM 3 — Tam build + simulate (kazanan yön)               ║
         // ╚══════════════════════════════════════════════════════════════╝
-        const result = await buildAndSimulate({
+        let result = await buildAndSimulate({
           direction: best.direction,
           notionalUsd: notional,
           owner: this.owner.publicKey,
@@ -206,8 +231,9 @@ export class PriceTicker {
         });
 
         // ╔══════════════════════════════════════════════════════════════╗
-        // ║  ADIM 4 — LIVE: Leg1 gönder → Leg2 TAZE oluştur → gönder    ║
-        // ║  Leg2 başarısız olursa Emergency Unwind devreye girer.        ║
+        // ║  ADIM 4 — LIVE EXECUTION                                      ║
+        // ║  Jito aktifse: Atomic bundle (Leg1+Leg2+Tip → tek blok)       ║
+        // ║  Değilse: Sequential (Leg1→confirm→Leg2)                      ║
         // ╚══════════════════════════════════════════════════════════════════╝
         console.log(
           `[LIVE][${pair}][${dirLabel(best.direction)}] Net kâr onaylandı ` +
@@ -215,7 +241,6 @@ export class PriceTicker {
             `${result.legs.length} leg gönderiliyor…`
         );
         // ── PRE-TRADE BALANCE SNAPSHOT ──
-        // İşlem başlamadan önce cüzdandaki kesin USDC ve SOL bakiyesini kaydet
         console.log(`[SNAPSHOT] Pre-trade bakiye çekiliyor…`);
         const preSnapshot = await takeBalanceSnapshot(this.owner.publicKey);
 
@@ -231,6 +256,177 @@ export class PriceTicker {
           preSolLamports: r.preSnapshot.solLamports.toString(),
           postSolLamports: r.postSnapshot.solLamports.toString(),
         });
+
+        const useJito = loadConfig().useJitoBundle;
+        const jitoReady = useJito && isJitoAvailable();
+        let executedSuccessfully = false;
+
+        if (useJito && !jitoReady) {
+          console.log(
+            `[JITO-FALLBACK][${pair}] Jito rate-limited (cooldown: ${getJitoCooldownRemaining()}s kaldı) → sequential mode`
+          );
+        }
+
+        if (jitoReady) {
+          // ═══════════════════════════════════════════════════════════
+          // ║  JITO BUNDLE PATH — Atomik 2-leg çalışma                ║
+          // ║  Leg1 + Leg2 + Tip → tek bundle → aynı blokta           ║
+          // ║  Emergency unwind sadece çok nadir Leg1-only durumda     ║
+          // ═══════════════════════════════════════════════════════════
+          console.log(
+            `[JITO][${pair}][${dirLabel(best.direction)}] Atomik bundle gönderiliyor…`
+          );
+
+          const atomicResult = await executeAtomicArbitrage({
+            buildResult: result,
+            signer: this.owner,
+            targetToken,
+          });
+
+          if (atomicResult.success) {
+            executedSuccessfully = true;
+            // ── POST-TRADE BALANCE SNAPSHOT (Jito başarılı) ──
+            let realizedPnlInfo: RealizedPnlInfo | undefined;
+            try {
+              // Bundle land etti — kısa bekleme sonrası bakiye oku
+              await new Promise((r) => setTimeout(r, 2_000));
+              console.log(`[SNAPSHOT] Post-trade bakiye çekiliyor (Jito)…`);
+              const postSnapshot = await takeBalanceSnapshot(this.owner.publicKey);
+              const realized = computeRealizedPnl(preSnapshot, postSnapshot);
+              realizedPnlInfo = toRealizedPnlInfo(realized);
+
+              console.log(
+                `[REALIZED vs ESTIMATED] Tahmini net: ${result.netProfit.netProfitUsdc.toFixed(6)} USDC | ` +
+                  `Gerçek net: ${realized.realizedNetProfitUsdc.toFixed(6)} USDC | ` +
+                  `Fark: ${(realized.realizedNetProfitUsdc - result.netProfit.netProfitUsdc).toFixed(6)} USDC`
+              );
+            } catch (snapErr) {
+              console.error(`[SNAPSHOT] Post-trade snapshot hatası:`, snapErr);
+            }
+
+            // Telemetri: Jito başarılı
+            const tel = buildTelemetry({
+              build: result,
+              direction: best.direction,
+              targetToken,
+              sendSignatures: atomicResult.signatures,
+              success: true,
+              status: "JITO_BUNDLE_LANDED",
+              netProfit: result.netProfit,
+              realizedPnl: realizedPnlInfo,
+            });
+            appendTradeLog(tel);
+            console.log(
+              `[JITO][${pair}][${dirLabel(best.direction)}] ✓ Bundle LANDED — ` +
+                `slot=${atomicResult.landedSlot}, signatures=${atomicResult.signatures.length}`
+            );
+          } else if (atomicResult.leg1OnChainButLeg2Failed) {            executedSuccessfully = true; // emergency unwind handles it            // ── NADIR DURUM: Leg1 on-chain, Leg2 yok — Emergency Unwind ──
+            console.warn(
+              `[JITO][${pair}][${dirLabel(best.direction)}] ★ INVENTORY EXPOSURE! ` +
+                `Leg1 on-chain, Leg2 başarısız → Emergency Unwind tetikleniyor…`
+            );
+
+            // Telemetri: Jito kısmi başarısızlık
+            const failTel = buildTelemetry({
+              build: result,
+              direction: best.direction,
+              targetToken,
+              sendSignatures: atomicResult.signatures,
+              success: false,
+              status: "JITO_BUNDLE_FAILED",
+              failReason: atomicResult.failReason ?? "Leg1 on-chain, Leg2 failed in bundle",
+              netProfit: result.netProfit,
+            });
+            appendTradeLog(failTel);
+
+            // Emergency Unwind: token → USDC via Jupiter
+            const leg1ExpectedOut = result.legs[0].expectedOut;
+            const unwindResult = await emergencyUnwind({
+              targetToken,
+              stuckAmountRaw: leg1ExpectedOut,
+              signer: this.owner,
+              direction: best.direction,
+              leg1Signature: atomicResult.leg1Signature,
+              actualTradeAmountUsdc: notional,
+            });
+
+            // Post-unwind snapshot
+            let realizedPnlInfoUnwind: RealizedPnlInfo | undefined;
+            try {
+              if (unwindResult.success && unwindResult.signature) {
+                await waitForConfirmation(unwindResult.signature, "confirmed");
+              }
+              console.log(`[SNAPSHOT] Post-unwind bakiye çekiliyor…`);
+              const postSnapshot = await takeBalanceSnapshot(this.owner.publicKey);
+              const realized = computeRealizedPnl(preSnapshot, postSnapshot);
+              realizedPnlInfoUnwind = toRealizedPnlInfo(realized);
+              console.log(
+                `[REALIZED-UNWIND] Gerçek net: ${realized.realizedNetProfitUsdc.toFixed(6)} USDC`
+              );
+            } catch (snapErr) {
+              console.error(`[SNAPSHOT] Post-unwind snapshot hatası:`, snapErr);
+            }
+
+            if (unwindResult.success) {
+              console.warn(
+                `[EMERGENCY-UNWIND] Sermaye kurtarıldı ✓ — ` +
+                  `loss=${unwindResult.lossUsdc?.toFixed(4) ?? "?"} USDC` +
+                  (realizedPnlInfoUnwind ? `, realized=${realizedPnlInfoUnwind.realizedNetProfitUsdc.toFixed(4)} USDC` : "")
+              );
+            } else {
+              console.error(
+                `[EMERGENCY-UNWIND] ★★★ SERMAYE KURTARILAMADI ★★★ — ` +
+                  `${unwindResult.failReason} — MANUAL INTERVENTION REQUIRED`
+              );
+            }
+          } else {
+            // ── TEMİZ BAŞARISIZLIK: Hiçbir TX on-chain değil ──
+            // → Sequential fallback deneniyor (legs rebuild)
+            console.warn(
+              `[JITO-FALLBACK][${pair}][${dirLabel(best.direction)}] Bundle başarısız — ` +
+                `${atomicResult.failReason ?? "unknown"} → Sequential fallback deneniyor…`
+            );
+            const failTel = buildTelemetry({
+              build: result,
+              direction: best.direction,
+              targetToken,
+              sendSignatures: atomicResult.signatures,
+              success: false,
+              status: "JITO_BUNDLE_FAILED",
+              failReason: atomicResult.failReason ?? "Bundle failed → sequential fallback",
+              netProfit: result.netProfit,
+            });
+            appendTradeLog(failTel);
+
+            // Jito prepareAtomicBundle TX'leri in-place değiştirdi (blockhash + sign).
+            // Sequential path için TAM YENİ legs gerekiyor.
+            try {
+              result = await buildAndSimulate({
+                direction: best.direction,
+                notionalUsd: notional,
+                owner: this.owner.publicKey,
+                targetToken,
+                dryRun: false,
+                // cachedEstimate kullanmıyoruz — taze quote gerekli
+              });
+              console.log(
+                `[JITO-FALLBACK][${pair}] Taze legs oluşturuldu — sequential devam ediyor`
+              );
+            } catch (rebuildErr) {
+              const reason = rebuildErr instanceof Error ? rebuildErr.message : String(rebuildErr);
+              console.error(
+                `[JITO-FALLBACK][${pair}] Sequential rebuild BAŞARISIZ: ${reason}`
+              );
+              executedSuccessfully = true; // prevent sequential with stale data
+            }
+          }
+        }
+
+        if (!executedSuccessfully) {
+          // ═══════════════════════════════════════════════════════════
+          // ║  SEQUENTIAL PATH — Mevcut Leg1→confirm→Leg2 akışı       ║
+          // ║  Jito devre dışı veya rate-limited → sequential fallback ║
+          // ═══════════════════════════════════════════════════════════
         // ── LEG 1: İlk bacağı zincire gönder ──
         const leg1 = result.legs[0];
         console.log(
@@ -371,6 +567,7 @@ export class PriceTicker {
             signer: this.owner,
             direction: best.direction,
             leg1Signature: leg1Sig,
+            actualTradeAmountUsdc: notional,
           });
 
           // ── POST-TRADE BALANCE SNAPSHOT (emergency unwind sonrası) ──
@@ -393,13 +590,20 @@ export class PriceTicker {
           }
 
           if (unwindResult.success) {
-            console.warn(
-              `[EMERGENCY-UNWIND] Sermaye kurtarıldı ✓ — ` +
-                `sig=${unwindResult.signature}, ` +
-                `loss=${unwindResult.lossUsdc?.toFixed(4) ?? "?"} USDC` +
-                (realizedPnlInfoUnwind ? `, realized=${realizedPnlInfoUnwind.realizedNetProfitUsdc.toFixed(4)} USDC` : "") +
-                `, attempts=${unwindResult.attempts}`
-            );
+            if (unwindResult.leg2AlreadySucceeded) {
+              console.warn(
+                `[EMERGENCY-UNWIND] Leg 2 zaten zincirde başarılı ✓ — unwind yapılmadı. ` +
+                  (realizedPnlInfoUnwind ? `Realized: ${realizedPnlInfoUnwind.realizedNetProfitUsdc.toFixed(4)} USDC` : "")
+              );
+            } else {
+              console.warn(
+                `[EMERGENCY-UNWIND] Sermaye kurtarıldı ✓ — ` +
+                  `sig=${unwindResult.signature}, ` +
+                  `loss=${unwindResult.lossUsdc?.toFixed(4) ?? "?"} USDC` +
+                  (realizedPnlInfoUnwind ? `, realized=${realizedPnlInfoUnwind.realizedNetProfitUsdc.toFixed(4)} USDC` : "") +
+                  `, attempts=${unwindResult.attempts}`
+              );
+            }
           } else {
             console.error(
               `[EMERGENCY-UNWIND] ★★★ SERMAYE KURTARILAMADI ★★★ — ` +
@@ -407,6 +611,7 @@ export class PriceTicker {
             );
           }
         }
+        } // end: if (!executedSuccessfully) — sequential path / jito fallback
       } catch (e) {
         if (e instanceof SendError) {
           console.error(`[LIVE][${pair}][SEND_FAILED] ${e.message}`);

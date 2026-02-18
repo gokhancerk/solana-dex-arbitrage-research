@@ -49,6 +49,14 @@ export interface AppConfig {
   dynamicPriorityFee: boolean;
   /** Dinamik fee üst sınırı (micro-lamports) */
   maxPriorityFee: number;
+  /** Jito Bundle kullanılsın mı? Env: USE_JITO_BUNDLE=true */
+  useJitoBundle: boolean;
+  /** Jito Block Engine URL (birincil). Env: JITO_BLOCK_ENGINE_URL */
+  jitoBlockEngineUrl: string;
+  /** Jito Block Engine URL listesi (round-robin failover). Env: JITO_BLOCK_ENGINE_URLS */
+  jitoBlockEngineUrls: string[];
+  /** Jito tip miktarı (lamports). Env: JITO_TIP_LAMPORTS */
+  jitoTipLamports: number;
 }
 
 export const DEFAULT_SLIPPAGE_BPS = 10; // 0.1%
@@ -65,6 +73,12 @@ export const DEFAULT_SCAN_TOKENS: readonly TokenSymbol[] = ["SOL", "WIF", "JUP"]
 export const DEFAULT_DYNAMIC_PRIORITY_FEE = true;
 /** Dinamik fee cap — aşırı fee ödemeyi engeller (micro-lamports) */
 export const DEFAULT_MAX_PRIORITY_FEE = 100_000;
+/** Jito Bundle varsayılan olarak kapalı — env: USE_JITO_BUNDLE=true */
+export const DEFAULT_USE_JITO_BUNDLE = false;
+/** Jito Block Engine varsayılan URL */
+export const DEFAULT_JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf";
+/** Jito tip varsayılan: 10,000 lamports (0.00001 SOL) */
+export const DEFAULT_JITO_TIP_LAMPORTS = 10_000;
 
 function requireEnv(name: string, optional = false): string | undefined {
   const v = process.env[name];
@@ -131,6 +145,18 @@ export function loadConfig(): AppConfig {
       : DEFAULT_SCAN_TOKENS,
     dynamicPriorityFee: (process.env.DYNAMIC_PRIORITY_FEE ?? "true") === "true",
     maxPriorityFee: Number(process.env.MAX_PRIORITY_FEE ?? DEFAULT_MAX_PRIORITY_FEE),
+    useJitoBundle: (process.env.USE_JITO_BUNDLE ?? "false") === "true",
+    jitoBlockEngineUrl: process.env.JITO_BLOCK_ENGINE_URL ?? DEFAULT_JITO_BLOCK_ENGINE_URL,
+    jitoBlockEngineUrls: process.env.JITO_BLOCK_ENGINE_URLS
+      ? process.env.JITO_BLOCK_ENGINE_URLS.split(",").map(s => s.trim()).filter(Boolean)
+      : [
+          process.env.JITO_BLOCK_ENGINE_URL ?? DEFAULT_JITO_BLOCK_ENGINE_URL,
+          "https://amsterdam.mainnet.block-engine.jito.wtf",
+          "https://frankfurt.mainnet.block-engine.jito.wtf",
+          "https://ny.mainnet.block-engine.jito.wtf",
+          "https://tokyo.mainnet.block-engine.jito.wtf",
+        ],
+    jitoTipLamports: Number(process.env.JITO_TIP_LAMPORTS ?? DEFAULT_JITO_TIP_LAMPORTS),
     tokens
   };
 }

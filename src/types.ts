@@ -118,7 +118,9 @@ export type TelemetryStatus =
   | "UNKNOWN_ERROR"
   | "EMERGENCY_UNWIND_SUCCESS"
   | "EMERGENCY_UNWIND_FAILED"
-  | "LEG2_REFRESH_FAILED";
+  | "LEG2_REFRESH_FAILED"
+  | "JITO_BUNDLE_LANDED"
+  | "JITO_BUNDLE_FAILED";
 
 export interface Telemetry {
   pair: TradePair;

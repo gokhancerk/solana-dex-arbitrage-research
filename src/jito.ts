@@ -21,8 +21,36 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import bs58 from "bs58";
+import { performance } from "perf_hooks";
 import { getConnection } from "./solana.js";
 import { loadConfig } from "./config.js";
+import type { JitoPrepSubTimings, JitoPrepErrorStage, JitoPrepSkipReason } from "./types.js";
+
+/** Jito prep hatası — hangi aşamada patladığını taşır */
+export class JitoPrepError extends Error {
+  readonly stage: JitoPrepErrorStage;
+  readonly code: string;
+  readonly partialTimings?: Partial<JitoPrepSubTimings>;
+  constructor(message: string, stage: JitoPrepErrorStage, code: string, partialTimings?: Partial<JitoPrepSubTimings>) {
+    super(message);
+    this.name = "JitoPrepError";
+    this.stage = stage;
+    this.code = code;
+    this.partialTimings = partialTimings;
+  }
+}
+
+/** Jito prep skip sinyali — error değil, graceful skip */
+export class JitoPrepSkip {
+  readonly reason: JitoPrepSkipReason;
+  readonly message: string;
+  readonly partialTimings?: Partial<JitoPrepSubTimings>;
+  constructor(reason: JitoPrepSkipReason, message: string, partialTimings?: Partial<JitoPrepSubTimings>) {
+    this.reason = reason;
+    this.message = message;
+    this.partialTimings = partialTimings;
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // ║  Constants                                                      ║
@@ -43,6 +71,15 @@ const TIP_ACCOUNTS_PATH = "/api/v1/bundles/tip_accounts";
 
 /** Tip hesapları cache TTL (ms) */
 const TIP_CACHE_TTL_MS = 300_000; // 5 dakika
+
+/** Tip accounts fetch timeout PER REQUEST (ms) — outlier kill */
+const TIP_ACCOUNTS_FETCH_TIMEOUT_MS = 600; // 600ms per-request hard cap
+
+/** Tip accounts fetch GLOBAL timeout (ms) — tüm endpoint + retry toplamı */
+const TIP_ACCOUNTS_GLOBAL_TIMEOUT_MS = 1500; // 1.5s absolute cap
+
+/** Tip accounts fetch max retry (per endpoint) */
+const TIP_ACCOUNTS_MAX_RETRIES = 1;
 
 /** Bundle landing polling aralığı (ms) */
 const BUNDLE_POLL_INTERVAL_MS = 2_000;
@@ -143,13 +180,73 @@ const FALLBACK_TIP_ACCOUNTS: string[] = [
 let _cachedTipAccounts: string[] | null = null;
 let _tipCacheFetchedAt = 0;
 
+/** Tip accounts fetch istatistikleri (son çağrı) */
+export interface TipAccountsFetchStats {
+  /** Retry sayısı (ilk deneme hariç, sadece tekrar denemeler) */
+  retries: number;
+  /** Retry delay toplam süresi (ms) */
+  retryDelayMsTotal: number;
+  /** API'den gelen ham string sayısı */
+  rawCount: number;
+  /** base58 doğrulamadan geçen geçerli hesap sayısı */
+  validCount: number;
+  /** Drop edilen geçersiz hesap sayısı */
+  droppedCount: number;
+  /** Fallback listesi mi kullanıldı */
+  usedFallback: boolean;
+  /** Cache'ten mi döndü (true = hiç fetch yapılmadı) */
+  fromCache: boolean;
+  /** Toplam deneme sayısı (ilk + retry'ler) */
+  attemptCount: number;
+  /** Her denemenin süresi (ms) */
+  attemptDurationsMs: number[];
+  /** Global timeout kapağına çarpıldı mı */
+  globalTimeoutHit: boolean;
+}
+
+const EMPTY_TIP_FETCH_STATS: TipAccountsFetchStats = {
+  retries: 0, retryDelayMsTotal: 0, rawCount: 0, validCount: 0, droppedCount: 0,
+  usedFallback: false, fromCache: false, attemptCount: 0, attemptDurationsMs: [], globalTimeoutHit: false,
+};
+
+let _lastTipFetchStats: TipAccountsFetchStats = { ...EMPTY_TIP_FETCH_STATS };
+
+/** Son tip accounts fetch istatistiklerini döndürür */
+export function getLastTipFetchStats(): TipAccountsFetchStats {
+  return { ..._lastTipFetchStats, attemptDurationsMs: [..._lastTipFetchStats.attemptDurationsMs] };
+}
+
+/**
+ * Base58 string'in geçerli bir Solana PublicKey olup olmadığını kontrol eder.
+ */
+function isValidBase58PublicKey(s: string): boolean {
+  try {
+    const trimmed = s.trim();
+    if (!trimmed || trimmed.length < 32 || trimmed.length > 44) return false;
+    new PublicKey(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Jito tip hesaplarını Block Engine API'den çeker, cache'ler.
  * API ulaşılamazsa bilinen fallback listesini döndürür.
+ *
+ * Her endpoint için TIP_ACCOUNTS_FETCH_TIMEOUT_MS hard timeout uygulanır.
+ * Retry: TIP_ACCOUNTS_MAX_RETRIES kadar tekrar dener.
  */
 export async function getJitoTipAccounts(): Promise<string[]> {
   const now = Date.now();
   if (_cachedTipAccounts && now - _tipCacheFetchedAt < TIP_CACHE_TTL_MS) {
+    // Cache hit — stats'ı sıfırla (retry yok, fetch yok)
+    _lastTipFetchStats = {
+      ...EMPTY_TIP_FETCH_STATS,
+      fromCache: true,
+      validCount: _cachedTipAccounts.length,
+      rawCount: _cachedTipAccounts.length,
+    };
     return _cachedTipAccounts;
   }
 
@@ -159,51 +256,196 @@ export async function getJitoTipAccounts(): Promise<string[]> {
     ? cfg.jitoBlockEngineUrls
     : [cfg.jitoBlockEngineUrl ?? DEFAULT_JITO_BLOCK_ENGINE_URL];
 
-  for (const baseUrl of urls) {
-    const url = `${baseUrl}${TIP_ACCOUNTS_PATH}`;
-    try {
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(5_000),
-      });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+  // Global AbortController — tüm endpoint + retry toplamı için hard cap
+  const globalAc = new AbortController();
+  const globalTimer = setTimeout(() => globalAc.abort(), TIP_ACCOUNTS_GLOBAL_TIMEOUT_MS);
+  const globalStartMs = Date.now();
+
+  let retries = 0;
+  let retryDelayMsTotal = 0;
+  let attemptCount = 0;
+  const attemptDurationsMs: number[] = [];
+  let globalTimeoutHit = false;
+
+  try {
+    for (const baseUrl of urls) {
+      // Global timeout kontrolü
+      if (globalAc.signal.aborted) {
+        globalTimeoutHit = true;
+        break;
       }
-      const accounts = (await res.json()) as string[];
-      if (Array.isArray(accounts) && accounts.length > 0) {
-        const valid = accounts.filter(
-          (a) => typeof a === "string" && a.length >= 32 && a.length <= 44
-        );
-        if (valid.length > 0) {
-          _cachedTipAccounts = valid;
-          _tipCacheFetchedAt = now;
-          console.log(
-            `[JITO] Tip hesapları güncellendi (${valid.length} hesap, kaynak: ${baseUrl.replace('https://', '').split('.')[0]})`
+
+      for (let attempt = 0; attempt <= TIP_ACCOUNTS_MAX_RETRIES; attempt++) {
+        // Global timeout kontrolü
+        if (globalAc.signal.aborted) {
+          globalTimeoutHit = true;
+          break;
+        }
+
+        if (attempt > 0) {
+          retries++;
+          const delayMs = 200 * attempt; // 200ms, 400ms backoff
+          retryDelayMsTotal += delayMs;
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+
+        attemptCount++;
+        const attemptStart = Date.now();
+
+        // Per-request timeout: min(PER_REQUEST_TIMEOUT, global remaining)
+        const globalRemainingMs = TIP_ACCOUNTS_GLOBAL_TIMEOUT_MS - (Date.now() - globalStartMs);
+        if (globalRemainingMs <= 0) {
+          globalTimeoutHit = true;
+          attemptDurationsMs.push(0);
+          break;
+        }
+        const perRequestTimeout = Math.min(TIP_ACCOUNTS_FETCH_TIMEOUT_MS, globalRemainingMs);
+
+        // Hem global hem per-request AbortSignal birleştir
+        const perAc = new AbortController();
+        const perTimer = setTimeout(() => perAc.abort(), perRequestTimeout);
+        // Global abort'u da per-request'e bağla
+        const onGlobalAbort = () => perAc.abort();
+        globalAc.signal.addEventListener("abort", onGlobalAbort, { once: true });
+
+        const url = `${baseUrl}${TIP_ACCOUNTS_PATH}`;
+        try {
+          const res = await fetch(url, {
+            signal: perAc.signal,
+          });
+          clearTimeout(perTimer);
+          globalAc.signal.removeEventListener("abort", onGlobalAbort);
+
+          const attemptMs = Date.now() - attemptStart;
+          attemptDurationsMs.push(attemptMs);
+
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          const rawAccounts = (await res.json()) as unknown[];
+
+          // Doğrulama: her string'i trim + base58 PublicKey ile validate et
+          const rawStrings = (Array.isArray(rawAccounts) ? rawAccounts : [])
+            .filter((a): a is string => typeof a === "string")
+            .map((a) => a.trim())
+            .filter((a) => a.length > 0);
+
+          // Log ilk 3 string (debug)
+          if (rawStrings.length > 0) {
+            console.log(
+              `[JITO][TIP_ACCOUNTS] Ham veri (ilk 3): ${rawStrings.slice(0, 3).map(s => `"${s}"`).join(", ")} (toplam: ${rawStrings.length}, ${attemptMs}ms)`
+            );
+          }
+
+          const valid = rawStrings.filter((a) => {
+            if (!isValidBase58PublicKey(a)) {
+              console.warn(`[JITO][TIP_ACCOUNTS] Geçersiz base58 PublicKey DROP edildi: "${a.slice(0, 20)}…"`);
+              return false;
+            }
+            return true;
+          });
+
+          const droppedCount = rawStrings.length - valid.length;
+
+          if (valid.length > 0) {
+            _cachedTipAccounts = valid;
+            _tipCacheFetchedAt = now;
+            _lastTipFetchStats = {
+              retries,
+              retryDelayMsTotal,
+              rawCount: rawStrings.length,
+              validCount: valid.length,
+              droppedCount,
+              usedFallback: false,
+              fromCache: false,
+              attemptCount,
+              attemptDurationsMs: [...attemptDurationsMs],
+              globalTimeoutHit: false,
+            };
+            console.log(
+              `[JITO] Tip hesapları güncellendi (${valid.length} geçerli / ${rawStrings.length} ham, ` +
+                `drop=${droppedCount}, attempts=${attemptCount}, retries=${retries}, ` +
+                `kaynak: ${baseUrl.replace('https://', '').split('.')[0]})`
+            );
+            return valid;
+          }
+
+          // Tüm hesaplar geçersiz — bu endpoint'te retry anlamsız, sonrakine geç
+          console.warn(
+            `[JITO][TIP_ACCOUNTS] ${baseUrl.replace('https://', '').split('.')[0]} — ` +
+              `${rawStrings.length} string geldi ama hiçbiri geçerli base58 PublicKey değil!`
           );
-          return valid;
+          break; // Bu endpoint'i atla, sonrakine geç
+        } catch (err) {
+          clearTimeout(perTimer);
+          globalAc.signal.removeEventListener("abort", onGlobalAbort);
+
+          const attemptMs = Date.now() - attemptStart;
+          attemptDurationsMs.push(attemptMs);
+
+          const reason = err instanceof Error ? err.message : String(err);
+          const isAbort = reason.includes("abort") || reason.includes("timeout") || reason.includes("TimeoutError");
+          const isGlobalTimeout = globalAc.signal.aborted;
+
+          if (isGlobalTimeout) {
+            globalTimeoutHit = true;
+            console.warn(
+              `[JITO] Tip hesapları GLOBAL TIMEOUT (${TIP_ACCOUNTS_GLOBAL_TIMEOUT_MS}ms cap) — ` +
+                `${attemptCount} attempt, ${attemptDurationsMs.map(d => d + "ms").join(",")}`
+            );
+            break;
+          }
+
+          console.warn(
+            `[JITO] Tip hesapları ${baseUrl.replace('https://', '').split('.')[0]} ` +
+              `${isAbort ? "TIMEOUT" : "hatası"} (attempt ${attempt + 1}/${TIP_ACCOUNTS_MAX_RETRIES + 1}, ${attemptMs}ms): ${reason}`
+          );
+          if (attempt < TIP_ACCOUNTS_MAX_RETRIES) continue; // retry same endpoint
+          break; // sonraki endpoint'i dene
         }
       }
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      console.warn(
-        `[JITO] Tip hesapları ${baseUrl.replace('https://', '').split('.')[0]} hatası: ${reason}`
-      );
-      continue; // sonraki endpoint'i dene
+
+      if (globalTimeoutHit) break;
     }
+  } finally {
+    clearTimeout(globalTimer);
   }
 
+  const totalElapsedMs = Date.now() - globalStartMs;
   console.warn(
-    `[JITO] Tüm endpoint'lerden tip hesapları alınamadı — fallback kullanılıyor`
+    `[JITO] Tüm endpoint'lerden tip hesapları alınamadı — fallback kullanılıyor ` +
+      `(attempts=${attemptCount}, retries=${retries}, elapsed=${totalElapsedMs}ms, ` +
+      `globalTimeout=${globalTimeoutHit}, perAttempt=[${attemptDurationsMs.map(d => d + "ms").join(",")}])`
   );
-  _cachedTipAccounts = FALLBACK_TIP_ACCOUNTS;
+
+  // Fallback listesini de validate et
+  const validFallback = FALLBACK_TIP_ACCOUNTS.filter(isValidBase58PublicKey);
+  _cachedTipAccounts = validFallback;
   _tipCacheFetchedAt = now;
-  return FALLBACK_TIP_ACCOUNTS;
+  _lastTipFetchStats = {
+    retries,
+    retryDelayMsTotal,
+    rawCount: FALLBACK_TIP_ACCOUNTS.length,
+    validCount: validFallback.length,
+    droppedCount: FALLBACK_TIP_ACCOUNTS.length - validFallback.length,
+    usedFallback: true,
+    fromCache: false,
+    attemptCount,
+    attemptDurationsMs: [...attemptDurationsMs],
+    globalTimeoutHit,
+  };
+  return validFallback;
 }
 
 /**
  * Rastgele bir Jito tip hesabı seçer.
  * Her bundle farklı tip hesabına gönderilir — yük dağılımı.
+ * Hesap base58 doğrulaması zaten getJitoTipAccounts'ta yapılır.
  */
 export function getRandomTipAccount(accounts: string[]): PublicKey {
+  if (accounts.length === 0) {
+    throw new Error("No valid tip accounts available");
+  }
   const idx = Math.floor(Math.random() * accounts.length);
   return new PublicKey(accounts[idx]);
 }
@@ -616,6 +858,10 @@ export interface AtomicBundleData {
   tipLamports: number;
   /** Her TX'in base58 signature'ı (on-chain doğrulama için) */
   txSignatures: string[];
+  /** Alt adım timing breakdown (experiment telemetrisi için) */
+  prepTimings?: JitoPrepSubTimings;
+  /** Tip accounts fetch tam istatistikleri */
+  tipFetchStats?: TipAccountsFetchStats;
 }
 
 /**
@@ -639,9 +885,24 @@ export async function prepareAtomicBundle(
   const cfg = loadConfig();
   const connection = getConnection();
 
+  let blockhashFetchMs = 0;
+  let tipAccountsFetchMs = 0;
+  let bundleBuildMs = 0;
+
   // 1. Taze blockhash al
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
-  console.log(`[JITO] Ortak blockhash: ${blockhash.slice(0, 16)}…`);
+  let blockhash: string;
+  try {
+    const t0 = performance.now();
+    ({ blockhash } = await connection.getLatestBlockhash("confirmed") as { blockhash: string });
+    blockhashFetchMs = Math.round(performance.now() - t0);
+    console.log(`[JITO] Ortak blockhash: ${blockhash.slice(0, 16)}… (${blockhashFetchMs}ms)`);
+  } catch (err: any) {
+    throw new JitoPrepError(
+      err.message ?? String(err),
+      "BLOCKHASH",
+      err.code ?? err.name ?? "UNKNOWN",
+    );
+  }
 
   // 2. Tüm TX'lerin blockhash'ini eşitle
   replaceBlockhash(params.leg1Tx, blockhash);
@@ -650,46 +911,107 @@ export async function prepareAtomicBundle(
   // 3. Tip TX oluştur
   const tipLamports =
     params.tipLamports ?? cfg.jitoTipLamports ?? DEFAULT_JITO_TIP_LAMPORTS;
-  const tipAccounts = await getJitoTipAccounts();
-  const tipAccount = getRandomTipAccount(tipAccounts);
+  let tipAccounts: string[];
+  let tipAccount: PublicKey;
 
-  console.log(
-    `[JITO] Tip: ${tipLamports} lamports → ${tipAccount.toBase58().slice(0, 12)}…`
-  );
+  // Sub-timing: t1 dışarıda — error durumunda da elapsed ölçülsün
+  const t1 = performance.now();
+  try {
+    tipAccounts = await getJitoTipAccounts();
+    tipAccountsFetchMs = Math.round(performance.now() - t1);
 
-  const tipTx = await buildTipTransaction({
-    payer: params.signer.publicKey,
-    tipAccount,
-    tipLamports,
-    blockhash,
-  });
+    // Validation: tüm hesaplar zaten getJitoTipAccounts'ta doğrulandı
+    // Ama boş dönmüş olabilir (tüm endpoint'ler + fallback bile başarısız)
+    if (tipAccounts.length === 0) {
+      const fetchStats = getLastTipFetchStats();
+      throw new JitoPrepSkip(
+        "INVALID_TIP_ACCOUNTS",
+        `Tüm tip hesapları geçersiz — raw=${fetchStats.rawCount}, valid=0, retries=${fetchStats.retries}`,
+        { blockhashFetchMs, tipAccountsFetchMs },
+      );
+    }
 
-  // 4. Tüm TX'leri imzala
-  params.leg1Tx.sign([params.signer]);
-  params.leg2Tx.sign([params.signer]);
-  tipTx.sign([params.signer]);
+    tipAccount = getRandomTipAccount(tipAccounts);
 
-  const signedTxs = [params.leg1Tx, params.leg2Tx, tipTx];
+    const fetchStats = getLastTipFetchStats();
+    console.log(
+      `[JITO] Tip: ${tipLamports} lamports → ${tipAccount.toBase58().slice(0, 12)}… ` +
+        `(tipFetch=${tipAccountsFetchMs}ms, valid=${fetchStats.validCount}/${fetchStats.rawCount}, retries=${fetchStats.retries})`
+    );
+  } catch (err: any) {
+    // Sub-timing: error durumunda da elapsed ölç
+    if (tipAccountsFetchMs === 0) {
+      tipAccountsFetchMs = Math.round(performance.now() - t1);
+    }
 
-  // 5. TX imzalarını çıkar
-  const txSignatures = signedTxs.map(
-    (tx) => extractSignature(tx) ?? "unknown"
-  );
+    // JitoPrepSkip — graceful skip, error değil
+    if (err instanceof JitoPrepSkip) {
+      throw err; // Caller'da özel olarak yakalanır
+    }
 
-  console.log(
-    `[JITO] Bundle hazır — ${signedTxs.length} TX:\n` +
-      `  Leg1: ${txSignatures[0].slice(0, 16)}…\n` +
-      `  Leg2: ${txSignatures[1].slice(0, 16)}…\n` +
-      `  Tip:  ${txSignatures[2].slice(0, 16)}…`
-  );
+    throw new JitoPrepError(
+      err.message ?? String(err),
+      "TIP_ACCOUNTS",
+      err.code ?? err.name ?? "UNKNOWN",
+      { blockhashFetchMs, tipAccountsFetchMs },
+    );
+  }
 
-  return {
-    signedTxs,
-    blockhash,
-    tipAccount,
-    tipLamports,
-    txSignatures,
-  };
+  // 4. Bundle build: tipTx oluştur + imzala + signature çıkar
+  try {
+    const t2 = performance.now();
+
+    const tipTx = await buildTipTransaction({
+      payer: params.signer.publicKey,
+      tipAccount,
+      tipLamports,
+      blockhash,
+    });
+
+    // Tüm TX'leri imzala
+    params.leg1Tx.sign([params.signer]);
+    params.leg2Tx.sign([params.signer]);
+    tipTx.sign([params.signer]);
+
+    const signedTxs = [params.leg1Tx, params.leg2Tx, tipTx];
+
+    // TX imzalarını çıkar
+    const txSignatures = signedTxs.map(
+      (tx) => extractSignature(tx) ?? "unknown"
+    );
+
+    bundleBuildMs = Math.round(performance.now() - t2);
+
+    console.log(
+      `[JITO] Bundle hazır — ${signedTxs.length} TX (build=${bundleBuildMs}ms):\n` +
+        `  Leg1: ${txSignatures[0].slice(0, 16)}…\n` +
+        `  Leg2: ${txSignatures[1].slice(0, 16)}…\n` +
+        `  Tip:  ${txSignatures[2].slice(0, 16)}…`
+    );
+
+    const fetchStats = getLastTipFetchStats();
+    return {
+      signedTxs,
+      blockhash,
+      tipAccount,
+      tipLamports,
+      txSignatures,
+      prepTimings: {
+        blockhashFetchMs,
+        tipAccountsFetchMs,
+        bundleBuildMs,
+      },
+      tipFetchStats: fetchStats,
+    };
+  } catch (err: any) {
+    if (err instanceof JitoPrepError) throw err;
+    throw new JitoPrepError(
+      err.message ?? String(err),
+      "BUNDLE_BUILD",
+      err.code ?? err.name ?? "UNKNOWN",
+      { blockhashFetchMs, tipAccountsFetchMs },
+    );
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════

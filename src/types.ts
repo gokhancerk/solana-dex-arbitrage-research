@@ -109,6 +109,7 @@ export type TelemetryStatus =
   | "SIMULATION_SUCCESS"
   | "SIMULATION_FAILED"
   | "DRY_RUN_PROFITABLE"
+  | "DRY_RUN_SIM_OK"
   | "REJECTED_LOW_PROFIT"
   | "SLIPPAGE_EXCEEDED"
   | "SEND_SUCCESS"
@@ -146,6 +147,62 @@ export interface Telemetry {
   // ───── Realized PnL (gerçek bakiye deltası) ─────
   /** Gerçek on-chain bakiye farkına dayalı kâr/zarar. Sadece SEND_SUCCESS ve EMERGENCY_UNWIND_* durumlarında dolu. */
   realizedPnl?: RealizedPnlInfo;
+  // ───── Latency Metrics (v1 telemetry extension) ─────
+  /** Per-cycle latency breakdown: quote, build, simulation, detect-to-send */
+  latencyMetrics?: LatencyMetrics;
+  // ───── Jito Bundle Telemetry ─────
+  /** Jito-specific metrics: send/landing slot, bundle status, inclusion delay */
+  jitoBundleTelemetry?: JitoBundleTelemetry;
+  // ───── Market Classification ─────
+  /** Market type classification at time of trade */
+  marketClassification?: MarketClassification;
+  // ───── Profit Drift Analysis ─────
+  /** Pre-send estimated net profit in USDC (from quote + fee estimation) */
+  expectedNetProfitUsdc?: number;
+  /** Profit drift: realizedPnl - expectedNetProfit. Negative = frontrun/spread close. */
+  profitDriftUsdc?: number;
+}
+
+// ───── Market Type Classification ─────
+export type MarketType = "A" | "B" | "C" | "UNKNOWN";
+
+export interface MarketClassification {
+  type: MarketType;
+  impact1k: number;     // price impact for $1k quote (%)
+  impact3k: number;     // price impact for $3k quote (%)
+  impact5k: number;     // price impact for $5k quote (%)
+  routeMarkets: number; // number of route segments
+  volume24h: number;    // 24h volume in USD
+  liquidity: number;    // total liquidity in USD
+  volumeLiquidityRatio: number;
+  slippageCurveRatio: number; // impact_5k / impact_1k
+  rejectReasons: string[];    // empty = accepted
+  eligible: boolean;          // true = Type C, can trade
+}
+
+// ───── Latency Metrics (per-cycle) ─────
+export interface LatencyMetrics {
+  detectSlot: number;
+  detectTimestamp: number;
+  quoteLatencyMs: number;
+  buildLatencyMs: number;
+  simulationLatencyMs: number;
+  detectToSendLatencyMs: number;
+  executionMode: "JITO" | "SEQUENTIAL";
+  /** Epoch ms when quote results were received (for stale quote detection) */
+  quoteReceivedTimestamp: number;
+  /** Time between quote receipt and TX send — stale quote risk metric (ms) */
+  quoteToSendLatencyMs: number;
+}
+
+// ───── Jito Bundle Telemetry ─────
+export interface JitoBundleTelemetry {
+  bundleSendSlot: number;
+  bundleSendTimestamp: number;
+  bundleLandingSlot: number | null;
+  bundleStatus: "LANDED" | "FAILED" | "TIMEOUT";
+  bundleLatencyMs: number;
+  bundleInclusionDelaySlots: number;
 }
 
 export class LimitBreachError extends Error {}

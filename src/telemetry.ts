@@ -1,6 +1,6 @@
 import { promises as fs } from "fs";
 import path from "path";
-import { BuildSimulateResult, Telemetry, TelemetryStatus, Direction, NetProfitInfo, RealizedPnlInfo } from "./types.js";
+import { BuildSimulateResult, Telemetry, TelemetryStatus, Direction, NetProfitInfo, RealizedPnlInfo, LatencyMetrics, JitoBundleTelemetry, MarketClassification } from "./types.js";
 import type { TradePair, TokenSymbol } from "./config.js";
 
 // ───── Logs directory & file path ─────
@@ -35,6 +35,14 @@ export interface BuildTelemetryParams {
   netProfit?: NetProfitInfo;
   /** On-chain gerçek bakiye deltasına dayalı kâr/zarar (Pre vs Post snapshot) */
   realizedPnl?: RealizedPnlInfo;
+  /** Per-cycle latency breakdown (v1 telemetry) */
+  latencyMetrics?: LatencyMetrics;
+  /** Jito bundle telemetry (v1 telemetry) */
+  jitoBundleTelemetry?: JitoBundleTelemetry;
+  /** Market type classification at time of trade */
+  marketClassification?: MarketClassification;
+  /** Pre-send estimated net profit (from quote + fees) for drift analysis */
+  expectedNetProfitUsdc?: number;
 }
 
 export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
@@ -49,6 +57,10 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
     status,
     netProfit,
     realizedPnl,
+    latencyMetrics,
+    jitoBundleTelemetry,
+    marketClassification,
+    expectedNetProfitUsdc,
   } = params;
 
   const pair: TradePair = `${targetToken}/USDC` as TradePair;
@@ -92,7 +104,25 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
     feeUsdc: realizedPnl?.solCostUsdc ?? netProfit?.feeUsdc ?? 0,
     status,
     realizedPnl,
+    latencyMetrics,
+    jitoBundleTelemetry,
+    marketClassification,
+    expectedNetProfitUsdc,
+    profitDriftUsdc: computeProfitDrift(expectedNetProfitUsdc, realizedPnl),
   };
+}
+
+/**
+ * Compute profit drift: realized - expected.
+ * Negative drift = spread closed or frontrun.
+ * Undefined if either value is missing.
+ */
+function computeProfitDrift(
+  expectedNetProfitUsdc: number | undefined,
+  realizedPnl: RealizedPnlInfo | undefined,
+): number | undefined {
+  if (expectedNetProfitUsdc === undefined || !realizedPnl) return undefined;
+  return realizedPnl.realizedNetProfitUsdc - expectedNetProfitUsdc;
 }
 
 // ───── JSONL Logging ─────
@@ -105,12 +135,15 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
  */
 const PERSISTABLE_STATUSES: ReadonlySet<TelemetryStatus> = new Set([
   "SIMULATION_SUCCESS",
+  "DRY_RUN_SIM_OK",
   "DRY_RUN_PROFITABLE",
   "REJECTED_LOW_PROFIT",
   "SEND_SUCCESS",
   "EMERGENCY_UNWIND_SUCCESS",
   "EMERGENCY_UNWIND_FAILED",
   "LEG2_REFRESH_FAILED",
+  "JITO_BUNDLE_LANDED",
+  "JITO_BUNDLE_FAILED",
 ]);
 
 /**

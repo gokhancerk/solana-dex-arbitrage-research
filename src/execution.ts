@@ -18,7 +18,8 @@ import {
   NetProfitRejectedError,
   NetProfitInfo,
   TelemetryStatus,
-  QuoteMeta
+  QuoteMeta,
+  LatencyMetrics
 } from "./types.js";
 import { fetchJupiterQuote, buildJupiterSwap, computeSlippageBps, simulateJupiterTx, type JupiterRouteInfo } from "./jupiter.js";
 import { fetchOkxQuote, buildOkxSwap, simulateOkxTx, isOkxAvailable, getOkxCooldownRemaining } from "./okxDex.js";
@@ -140,13 +141,6 @@ export async function estimateDirectionProfit(params: {
   const cfg = loadConfig();
   enforceNotional(params.notionalUsd, cfg.notionalCapUsd);
 
-  // OKX rate-limited ise bu yönü boşuna deneme — hızlı skip
-  if (!isOkxAvailable()) {
-    throw new Error(
-      `OKX rate-limited (${getOkxCooldownRemaining()}s kaldı) — ${params.direction} atlanıyor`
-    );
-  }
-
   const targetToken: TokenSymbol = params.targetToken ?? "WIF";
   const usdcDecimals = cfg.tokens.USDC.decimals;
   const usdcMint = cfg.tokens.USDC.mint;
@@ -158,38 +152,67 @@ export async function estimateDirectionProfit(params: {
   let _cachedJupMeta: QuoteMeta | undefined;
   let _cachedOkxMeta: QuoteMeta | undefined;
 
-  if (params.direction === "JUP_TO_OKX") {
+  // ── EXPERIMENT MODE A: Jupiter-only ──
+  // OKX çağrılarını tamamen bypass et; her iki bacak Jupiter üzerinden yapılır.
+  if (cfg.experimentJupiterOnly) {
+    // Sadece JUP_TO_OKX yönünü destekle (OKX yok → tek yön yeterli)
     // Leg 1: Jupiter USDC → targetToken
-    const { route, meta: jupMeta } = await fetchJupiterQuote({
+    const { route, meta: jupMeta1 } = await fetchJupiterQuote({
       inputMint: usdcMint, outputMint: targetMint,
       amount: amountRaw, slippageBps: cfg.slippageBps,
     });
     _cachedJupRoute = route;
-    _cachedJupMeta = jupMeta;
-    // Leg 2: OKX targetToken → USDC
-    const { meta: okxMeta } = await fetchOkxQuote({
+    _cachedJupMeta = jupMeta1;
+    // Leg 2: Jupiter targetToken → USDC (OKX yerine)
+    const { meta: jupMeta2 } = await fetchJupiterQuote({
       inputMint: targetMint, outputMint: usdcMint,
-      amount: jupMeta.expectedOut, slippageBps: cfg.slippageBps,
-      userPublicKey: params.ownerStr,
+      amount: jupMeta1.expectedOut, slippageBps: cfg.slippageBps,
     });
-    _cachedOkxMeta = okxMeta;
-    finalOutRaw = okxMeta.expectedOut;
+    // OKX meta yerine Jupiter meta'sını kullan (venue etiketini koru)
+    _cachedOkxMeta = { ...jupMeta2, venue: "OKX" as const };
+    finalOutRaw = jupMeta2.expectedOut;
   } else {
-    // Leg 1: OKX USDC → targetToken
-    const { meta: okxMeta } = await fetchOkxQuote({
-      inputMint: usdcMint, outputMint: targetMint,
-      amount: amountRaw, slippageBps: cfg.slippageBps,
-      userPublicKey: params.ownerStr,
-    });
-    _cachedOkxMeta = okxMeta;
-    // Leg 2: Jupiter targetToken → USDC
-    const { route, meta: jupMeta } = await fetchJupiterQuote({
-      inputMint: targetMint, outputMint: usdcMint,
-      amount: okxMeta.expectedOut, slippageBps: cfg.slippageBps,
-    });
-    _cachedJupRoute = route;
-    _cachedJupMeta = jupMeta;
-    finalOutRaw = jupMeta.expectedOut;
+    // ── Normal: OKX bacağı aktif ──
+    // OKX rate-limited ise bu yönü boşuna deneme — hızlı skip
+    if (!isOkxAvailable()) {
+      throw new Error(
+        `OKX rate-limited (${getOkxCooldownRemaining()}s kaldı) — ${params.direction} atlanıyor`
+      );
+    }
+
+    if (params.direction === "JUP_TO_OKX") {
+      // Leg 1: Jupiter USDC → targetToken
+      const { route, meta: jupMeta } = await fetchJupiterQuote({
+        inputMint: usdcMint, outputMint: targetMint,
+        amount: amountRaw, slippageBps: cfg.slippageBps,
+      });
+      _cachedJupRoute = route;
+      _cachedJupMeta = jupMeta;
+      // Leg 2: OKX targetToken → USDC
+      const { meta: okxMeta } = await fetchOkxQuote({
+        inputMint: targetMint, outputMint: usdcMint,
+        amount: jupMeta.expectedOut, slippageBps: cfg.slippageBps,
+        userPublicKey: params.ownerStr,
+      });
+      _cachedOkxMeta = okxMeta;
+      finalOutRaw = okxMeta.expectedOut;
+    } else {
+      // Leg 1: OKX USDC → targetToken
+      const { meta: okxMeta } = await fetchOkxQuote({
+        inputMint: usdcMint, outputMint: targetMint,
+        amount: amountRaw, slippageBps: cfg.slippageBps,
+        userPublicKey: params.ownerStr,
+      });
+      _cachedOkxMeta = okxMeta;
+      // Leg 2: Jupiter targetToken → USDC
+      const { route, meta: jupMeta } = await fetchJupiterQuote({
+        inputMint: targetMint, outputMint: usdcMint,
+        amount: okxMeta.expectedOut, slippageBps: cfg.slippageBps,
+      });
+      _cachedJupRoute = route;
+      _cachedJupMeta = jupMeta;
+      finalOutRaw = jupMeta.expectedOut;
+    }
   }
 
   const grossProfitRaw = finalOutRaw - amountRaw;
@@ -300,11 +323,177 @@ async function simulateLegSafe(leg: SimulatedLeg, venue: "JUPITER" | "OKX", dryR
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ║  EXPERIMENT MODE A — Jupiter-only build + simulate                   ║
+// ║  OKX bypass: Leg1 (USDC→token) + Leg2 (token→USDC) both via Jupiter ║
+// ═══════════════════════════════════════════════════════════════════════
+import type { AppConfig } from "./config.js";
+
+async function buildAndSimulateJupiterOnly(
+  params: BuildParams,
+  cfg: AppConfig,
+  targetToken: TokenSymbol,
+): Promise<BuildSimulateResult> {
+  const startTs = Date.now();
+
+  const usdcDecimals = cfg.tokens.USDC.decimals;
+  const usdcMint = cfg.tokens.USDC.mint;
+  const targetMint = cfg.tokens[targetToken].mint;
+
+  const amountRaw = toRaw(params.notionalUsd, usdcDecimals);
+  const ownerStr = params.owner.toBase58();
+  const dynFee = await resolvePriorityFee();
+
+  const legs: SimulatedLeg[] = [];
+  const quoteMeta: BuildSimulateResult["quoteMeta"] = [];
+
+  // ── Split timing instrumentation (Experiment D) ──
+  let cumulativeBuildOnlyMs = 0;
+  let cumulativeSimulateOnlyMs = 0;
+
+  console.log(`[EXPERIMENT-A] Jupiter-only build — USDC→${targetToken}→USDC, notional=${params.notionalUsd}${cfg.experimentNoSimulate ? " [NO_SIMULATE]" : ""}`);
+
+  // ── Leg 1: Jupiter USDC → targetToken ──
+  const cached = params.cachedEstimate;
+  let jupRoute1: JupiterRouteInfo;
+  let jupMeta1: QuoteMeta;
+
+  const buildLeg1Start = Date.now();
+  if (cached?._cachedJupRoute && cached?._cachedJupMeta) {
+    jupRoute1 = cached._cachedJupRoute;
+    jupMeta1 = cached._cachedJupMeta;
+    console.log(`[EXPERIMENT-A][CACHE] Leg 1 — cached Jupiter route (expectedOut=${jupMeta1.expectedOut.toString()})`);
+  } else {
+    const t0 = Date.now();
+    const r1 = await fetchJupiterQuote({
+      inputMint: usdcMint, outputMint: targetMint,
+      amount: amountRaw, slippageBps: cfg.slippageBps,
+    });
+    jupRoute1 = r1.route;
+    jupMeta1 = r1.meta;
+    console.log(`[EXPERIMENT-A][FRESH] Leg 1 Jupiter quote (${Date.now() - t0}ms) — expectedOut=${jupMeta1.expectedOut.toString()}`);
+  }
+  quoteMeta.push(jupMeta1);
+
+  const quoteReceivedTimestamp1 = Date.now();
+
+  const jupTx1 = await buildJupiterSwap({ route: jupRoute1, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
+  const jupLeg1: SimulatedLeg = {
+    venue: "JUPITER",
+    tx: jupTx1,
+    outMint: targetMint,
+    owner: ownerStr,
+    expectedOut: jupMeta1.expectedOut,
+    simulatedOut: jupMeta1.expectedOut,
+    simulation: { logs: [] },
+  };
+  cumulativeBuildOnlyMs += Date.now() - buildLeg1Start;
+
+  // Leg 1 simulate (dryRun durumunda — NO_SIMULATE modda atlanır)
+  if (params.dryRun && !cfg.experimentNoSimulate) {
+    const simStart = Date.now();
+    legs.push(await simulateLegSafe(jupLeg1, "JUPITER", true));
+    const simDuration = Date.now() - simStart;
+    cumulativeSimulateOnlyMs += simDuration;
+    console.log(`[EXPERIMENT-A] Leg 1 simülasyon (${simDuration}ms)`);
+  } else {
+    if (cfg.experimentNoSimulate) {
+      console.log(`[EXPERIMENT-B] Leg 1 simülasyon ATLANDI (NO_SIMULATE)`);
+    }
+    legs.push(jupLeg1);
+  }
+
+  // ── Leg 2: Jupiter targetToken → USDC (OKX yerine) ──
+  const buildLeg2Start = Date.now();
+  const { route: jupRoute2, meta: jupMeta2 } = await fetchJupiterQuote({
+    inputMint: targetMint, outputMint: usdcMint,
+    amount: jupMeta1.expectedOut, slippageBps: cfg.slippageBps,
+  });
+  console.log(`[EXPERIMENT-A][FRESH] Leg 2 Jupiter quote (${Date.now() - buildLeg2Start}ms) — expectedOut=${jupMeta2.expectedOut.toString()}`);
+  // Venue etiketini "OKX" bırakıyoruz ki telemetri şeması bozulmasın
+  quoteMeta.push({ ...jupMeta2, venue: "OKX" as const });
+
+  const quoteReceivedTimestamp2 = Date.now();
+  const quoteLatencyMs = quoteReceivedTimestamp2 - startTs;
+
+  const jupTx2 = await buildJupiterSwap({ route: jupRoute2, userPublicKey: params.owner, priorityFeeMicroLamports: dynFee });
+  const jupLeg2: SimulatedLeg = {
+    venue: "JUPITER", // Gerçekte Jupiter — experiment mode
+    tx: jupTx2,
+    outMint: usdcMint,
+    owner: ownerStr,
+    expectedOut: jupMeta2.expectedOut,
+    simulatedOut: jupMeta2.expectedOut,
+    simulation: { logs: [] },
+  };
+  cumulativeBuildOnlyMs += Date.now() - buildLeg2Start;
+
+  // Leg 2 simulate (dryRun durumunda — NO_SIMULATE modda atlanır)
+  if (params.dryRun && !cfg.experimentNoSimulate) {
+    const simStart = Date.now();
+    legs.push(await simulateLegSafe(jupLeg2, "JUPITER", true));
+    const simDuration = Date.now() - simStart;
+    cumulativeSimulateOnlyMs += simDuration;
+    console.log(`[EXPERIMENT-A] Leg 2 simülasyon (${simDuration}ms)`);
+  } else {
+    if (cfg.experimentNoSimulate) {
+      console.log(`[EXPERIMENT-B] Leg 2 simülasyon ATLANDI (NO_SIMULATE)`);
+    }
+    legs.push(jupLeg2);
+  }
+
+  // ── Net Profit hesabı ──
+  const leg2ExpectedOut = legs[legs.length - 1].expectedOut;
+  const grossProfitRaw = leg2ExpectedOut - amountRaw;
+  const grossProfitUsdc = Number(grossProfitRaw) / 10 ** usdcDecimals;
+  const dynamicFee = await resolvePriorityFee();
+  const feeSol = estimateTxFeeSol(dynamicFee, legs.length);
+  const feeUsdc = estimateFeeUsdc(feeSol, cfg.solUsdcRate);
+  const netProfitUsdc = grossProfitUsdc - feeUsdc;
+  const netProfit: NetProfitInfo = { grossProfitUsdc, feeUsdc, netProfitUsdc };
+
+  const buildEndTs = Date.now();
+  const totalBuildLatencyMs = buildEndTs - startTs;
+
+  const experimentLabel = cfg.experimentNoSimulate ? "B (NO_SIMULATE)" : "A (JUPITER_ONLY)";
+  console.log(
+    `[EXPERIMENT-${experimentLabel}] Sonuç — brüt: ${grossProfitUsdc.toFixed(6)} USDC, ` +
+    `fee: ${feeUsdc.toFixed(6)} USDC, net: ${netProfitUsdc.toFixed(6)} USDC, ` +
+    `quoteLatency: ${quoteLatencyMs}ms, buildLatency: ${totalBuildLatencyMs}ms` +
+    (cumulativeSimulateOnlyMs > 0 ? `, buildOnly: ${cumulativeBuildOnlyMs}ms, simOnly: ${cumulativeSimulateOnlyMs}ms` : "")
+  );
+
+  return {
+    direction: params.direction,
+    legs,
+    quoteMeta,
+    netProfit,
+    timingSplit: {
+      buildOnlyMs: cumulativeBuildOnlyMs,
+      simulateOnlyMs: cumulativeSimulateOnlyMs,
+      totalMs: totalBuildLatencyMs,
+    },
+  };
+}
+
 export async function buildAndSimulate(params: BuildParams): Promise<BuildSimulateResult> {
   const cfg = loadConfig();
   const targetToken: TokenSymbol = params.targetToken ?? "WIF";
   console.log(`[DEBUG] buildAndSimulate başladı — direction=${params.direction}, targetToken=${targetToken}, notional=${params.notionalUsd}`);
   enforceNotional(params.notionalUsd, cfg.notionalCapUsd);
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ║  EXPERIMENT MODE A — Jupiter-only build+simulate                ║
+  // ║  OKX tamamen bypass; her iki leg Jupiter üzerinden yapılır.     ║
+  // ═══════════════════════════════════════════════════════════════════
+  if (cfg.experimentJupiterOnly) {
+    return buildAndSimulateJupiterOnly(params, cfg, targetToken);
+  }
+
+  // ── Latency instrumentation ──
+  const bsStartTimestamp = Date.now();
+  let quoteReceivedTimestamp = 0;
+  let quoteLatencyMs = 0;
 
   const usdcDecimals = cfg.tokens.USDC.decimals;
   const usdcMint = cfg.tokens.USDC.mint;
@@ -502,6 +691,10 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
     legs.push(jupLeg);
   }
 
+  // ── Latency: quote phase complete ──
+  quoteReceivedTimestamp = Date.now();
+  quoteLatencyMs = quoteReceivedTimestamp - bsStartTimestamp;
+
   // ───── Net Profit hesabı (tüm kod yollarında telemetri için ÖNCE hesapla) ─────
   const leg2 = legs[legs.length - 1];
   const leg2ExpectedOut = leg2.expectedOut;       // bigint — quote'tan gelen raw USDC
@@ -524,6 +717,28 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
   // Telemetri için partial result — her yolda kullanılacak
   const partialResult: BuildSimulateResult = { direction: params.direction, legs, quoteMeta, netProfit };
+
+  // ── Build latency metrics helper ──
+  const buildEndTimestamp = Date.now();
+  const buildLatencyMs = buildEndTimestamp - bsStartTimestamp;
+  if (quoteReceivedTimestamp === 0) quoteReceivedTimestamp = bsStartTimestamp; // fallback
+  const buildLatencyMetrics = (): LatencyMetrics => {
+    const sendTimestamp = Date.now();
+    return {
+      detectSlot: 0,
+      detectTimestamp: bsStartTimestamp,
+      quoteLatencyMs,
+      buildLatencyMs,
+      simulationLatencyMs: buildLatencyMs,
+      jitoPrepLatencyMs: null,
+      jitoPrepAttempted: false,
+      jitoPrepSkippedReason: "DISABLED",
+      detectToSendLatencyMs: sendTimestamp - bsStartTimestamp,
+      executionMode: "SEQUENTIAL",
+      quoteReceivedTimestamp,
+      quoteToSendLatencyMs: sendTimestamp - quoteReceivedTimestamp,
+    };
+  };
 
   // ───── Slippage & Simulation kontrolleri ─────
   for (const [idx, leg] of legs.entries()) {
@@ -562,8 +777,13 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
 
   if (!approved) {
     const failReason = `Net kâr (${netProfitUsdc.toFixed(6)} USDC) minimum eşiğin (${effectiveMinProfit.toFixed(4)} USDC, ${PROFIT_GATE_BUFFER}x buffer) altında — işlem iptal edildi`;
-    const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: false, failReason, status: "REJECTED_LOW_PROFIT", netProfit });
+    const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: false, failReason, status: "REJECTED_LOW_PROFIT", netProfit, latencyMetrics: buildLatencyMetrics() });
     appendTradeLog(tel);
+
+    // Dry-run: throw yerine sonucu döndür — kullanıcı sim detaylarını görebilsin
+    if (params.dryRun) {
+      return partialResult;
+    }
     throw new NetProfitRejectedError(failReason, netProfit);
   }
 
@@ -573,7 +793,7 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
   const hasSimErrors = legs.some(l => l.simulation.error);
   if (params.dryRun) {
     const finalStatus: TelemetryStatus = hasSimErrors ? "DRY_RUN_PROFITABLE" : "SIMULATION_SUCCESS";
-    const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: !hasSimErrors, status: finalStatus, netProfit,
+    const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: !hasSimErrors, status: finalStatus, netProfit, latencyMetrics: buildLatencyMetrics(),
       failReason: hasSimErrors ? legs.filter(l => l.simulation.error).map(l => `${l.venue}: ${l.simulation.error}`).join('; ') : undefined });
     appendTradeLog(tel);
   } else {

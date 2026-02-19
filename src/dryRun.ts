@@ -45,8 +45,13 @@ async function main() {
   try {
     const result = await buildAndSimulate({ direction, notionalUsd: notional, owner: owner.publicKey, targetToken, dryRun: true });
 
+    // Net profit kontrolü — kârsız trade bilgilendirme mesajı
+    const netProfitUsdc = result.netProfit?.netProfitUsdc ?? 0;
+    const minProfit = Number(process.env.MIN_NET_PROFIT_USDC ?? 0.12);
+    const profitable = netProfitUsdc >= minProfit;
+
     console.log(`\n╔══════════════════════════════════════════════════════════╗`);
-    console.log(`║  Dry-Run Sonuçları                                      ║`);
+    console.log(`║  Dry-Run Sonuçları  ${profitable ? '✓ PROFITABLE' : '✗ KÂRSIZ    '}                       ║`);
     console.log(`╠══════════════════════════════════════════════════════════╣`);
     result.legs.forEach((leg, idx) => {
       const status = leg.simulation.error ? "⚠ SIM HATASI" : "✓ SIM OK";

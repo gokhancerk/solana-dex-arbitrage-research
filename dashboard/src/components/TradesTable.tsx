@@ -66,8 +66,22 @@ function StatusBadge({ log }: { log: TradeLog }) {
         Unwind
       </Badge>
     );
+  }  // Jito bundle landed
+  if (log.status === "JITO_BUNDLE_LANDED") {
+    return (
+      <Badge variant="default" className="bg-green-600">
+        Jito Ba\u015far\u0131l\u0131
+      </Badge>
+    );
   }
-  // Leg2 hatası
+  // Jito bundle failed
+  if (log.status === "JITO_BUNDLE_FAILED") {
+    return (
+      <Badge variant="secondary" className="text-orange-500">
+        Jito Ba\u015far\u0131s\u0131z
+      </Badge>
+    );
+  }  // Leg2 hatası
   if (log.status === "LEG2_REFRESH_FAILED") {
     return (
       <Badge variant="destructive">

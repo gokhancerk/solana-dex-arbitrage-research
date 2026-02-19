@@ -14,14 +14,14 @@ interface StatsCardsProps {
 export function StatsCards({ logs }: StatsCardsProps) {
   const totalOpportunities = logs.length;
 
-  // Sadece zincire başarıyla gönderilen işlemler (SEND_SUCCESS)
+  // Sadece zincire başarıyla gönderilen işlemler (SEND_SUCCESS veya JITO_BUNDLE_LANDED)
   const onChainTrades = logs.filter(
-    (l) => l.status === "SEND_SUCCESS"
+    (l) => l.status === "SEND_SUCCESS" || l.status === "JITO_BUNDLE_LANDED"
   );
 
   // Reddedilen / iptal edilen (zincire gitmedi)
   const rejectedTrades = logs.filter(
-    (l) => l.status === "REJECTED_LOW_PROFIT" || l.status === "SIMULATION_SUCCESS"
+    (l) => l.status === "REJECTED_LOW_PROFIT" || l.status === "SIMULATION_SUCCESS" || l.status === "JITO_BUNDLE_FAILED"
   );
 
   // Winrate: zincire giden / toplam fırsat

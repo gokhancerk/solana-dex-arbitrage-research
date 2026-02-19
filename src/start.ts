@@ -3,6 +3,7 @@ loadDotenv();
 
 import { startServer } from "./server.js";
 import { PriceTicker } from "./stream/priceTicker.js";
+import { loadConfig } from "./config.js";
 
 // ─── Ana başlatıcı ──────────────────────────────────────────────────
 // Express API sunucusu (dashboard için) + PriceTicker (bi-directional event-driven döngüsü)
@@ -60,6 +61,18 @@ async function main() {
 
   // 1) Express API sunucusu — her durumda ayağa kalksın
   startServer();
+
+  // Dry-run modu bilgilendirmesi
+  const cfg = loadConfig();
+  if (cfg.dryRun) {
+    console.log(
+      `\n╔══════════════════════════════════════════════════════════╗\n` +
+      `║  ★ DRY-RUN MODU AKTİF — Mainnet TX gönderimi KAPALI   ║\n` +
+      `║  Sadece quote + simulate yapılır, zincire TX gitmez.   ║\n` +
+      `║  Canlıya geçmek için: DRY_RUN=false                    ║\n` +
+      `╚══════════════════════════════════════════════════════════╝\n`
+    );
+  }
 
   // 2) PriceTicker — hata olursa retry ile başlat, Express'i çökertme
   await launchPriceTicker();

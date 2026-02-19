@@ -57,6 +57,8 @@ export interface AppConfig {
   jitoBlockEngineUrls: string[];
   /** Jito tip miktarı (lamports). Env: JITO_TIP_LAMPORTS */
   jitoTipLamports: number;
+  /** Dry-run modu: TX gönderilmez, sadece quote + simulate yapılır. Env: DRY_RUN=true */
+  dryRun: boolean;
 }
 
 export const DEFAULT_SLIPPAGE_BPS = 10; // 0.1%
@@ -79,6 +81,8 @@ export const DEFAULT_USE_JITO_BUNDLE = false;
 export const DEFAULT_JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf";
 /** Jito tip varsayılan: 10,000 lamports (0.00001 SOL) */
 export const DEFAULT_JITO_TIP_LAMPORTS = 10_000;
+/** Dry-run modu varsayılan: aktif — mainnet gönderim kapalı */
+export const DEFAULT_DRY_RUN = true;
 
 function requireEnv(name: string, optional = false): string | undefined {
   const v = process.env[name];
@@ -157,6 +161,7 @@ export function loadConfig(): AppConfig {
           "https://tokyo.mainnet.block-engine.jito.wtf",
         ],
     jitoTipLamports: Number(process.env.JITO_TIP_LAMPORTS ?? DEFAULT_JITO_TIP_LAMPORTS),
+    dryRun: (process.env.DRY_RUN ?? String(DEFAULT_DRY_RUN)) === "true",
     tokens
   };
 }

@@ -21,7 +21,7 @@ import {
   QuoteMeta
 } from "./types.js";
 import { fetchJupiterQuote, buildJupiterSwap, computeSlippageBps, simulateJupiterTx, type JupiterRouteInfo } from "./jupiter.js";
-import { fetchOkxQuote, buildOkxSwap, simulateOkxTx } from "./okxDex.js";
+import { fetchOkxQuote, buildOkxSwap, simulateOkxTx, isOkxAvailable, getOkxCooldownRemaining } from "./okxDex.js";
 import { buildTelemetry, appendTradeLog } from "./telemetry.js";
 import {
   prepareAtomicBundle,
@@ -127,6 +127,8 @@ export function pairFromToken(token: TokenSymbol): TradePair {
  * Fetch quotes for both legs of a direction and estimate net profit
  * WITHOUT building transactions or simulating. This is cheap and fast,
  * suitable for parallel comparison of JUP_TO_OKX vs OKX_TO_JUP.
+ *
+ * OKX rate-limited ise hızlıca hata fırlatır — caller bunu yakalar ve atlar.
  */
 export async function estimateDirectionProfit(params: {
   direction: Direction;
@@ -137,6 +139,13 @@ export async function estimateDirectionProfit(params: {
 }): Promise<QuoteEstimate> {
   const cfg = loadConfig();
   enforceNotional(params.notionalUsd, cfg.notionalCapUsd);
+
+  // OKX rate-limited ise bu yönü boşuna deneme — hızlı skip
+  if (!isOkxAvailable()) {
+    throw new Error(
+      `OKX rate-limited (${getOkxCooldownRemaining()}s kaldı) — ${params.direction} atlanıyor`
+    );
+  }
 
   const targetToken: TokenSymbol = params.targetToken ?? "WIF";
   const usdcDecimals = cfg.tokens.USDC.decimals;
@@ -539,27 +548,37 @@ export async function buildAndSimulate(params: BuildParams): Promise<BuildSimula
   }
 
   // ───── Net Profit Gate ─────
-  const approved = netProfitUsdc >= cfg.minNetProfitUsdc;
+  // Live modda spread buffer uygulanır: tahmini kâr > min * 1.5 olmalı
+  // Böylece on-chain slippage ve gas maliyeti karşısında marjinal trade'ler engellenir
+  const PROFIT_GATE_BUFFER = params.dryRun ? 1.0 : 1.5;
+  const effectiveMinProfit = cfg.minNetProfitUsdc * PROFIT_GATE_BUFFER;
+  const approved = netProfitUsdc >= effectiveMinProfit;
   const tag = approved ? "ONAYLANDI" : "REDDEDİLDİ";
   console.log(
     `[KARAR] Brüt Kâr: ${grossProfitUsdc.toFixed(6)} USDC, ` +
     `Tahmini Fee: ${feeUsdc.toFixed(6)} USDC (${feeSol.toFixed(9)} SOL @ ${cfg.solUsdcRate}), ` +
-    `Net Kâr: ${netProfitUsdc.toFixed(6)} USDC -> İşlem [${tag}]`
+    `Net Kâr: ${netProfitUsdc.toFixed(6)} USDC (min: ${effectiveMinProfit.toFixed(4)}, buffer: ${PROFIT_GATE_BUFFER}x) -> İşlem [${tag}]`
   );
 
   if (!approved) {
-    const failReason = `Net kâr (${netProfitUsdc.toFixed(6)} USDC) minimum eşiğin (${cfg.minNetProfitUsdc} USDC) altında — işlem iptal edildi`;
+    const failReason = `Net kâr (${netProfitUsdc.toFixed(6)} USDC) minimum eşiğin (${effectiveMinProfit.toFixed(4)} USDC, ${PROFIT_GATE_BUFFER}x buffer) altında — işlem iptal edildi`;
     const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: false, failReason, status: "REJECTED_LOW_PROFIT", netProfit });
     appendTradeLog(tel);
     throw new NetProfitRejectedError(failReason, netProfit);
   }
 
-  // ───── Onaylandı → telemetri kaydet & return ─────
+  // ───── Onaylandı ─────
+  // Live modda SIMULATION_SUCCESS telemetrisi YAZILMAZ — execution path kendi telemetrisini yazar.
+  // Böylece phantom "Onay Bekliyor" kayıtları önlenir.
   const hasSimErrors = legs.some(l => l.simulation.error);
-  const finalStatus: TelemetryStatus = (hasSimErrors && params.dryRun) ? "DRY_RUN_PROFITABLE" : "SIMULATION_SUCCESS";
-  const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: !hasSimErrors, status: finalStatus, netProfit,
-    failReason: hasSimErrors ? legs.filter(l => l.simulation.error).map(l => `${l.venue}: ${l.simulation.error}`).join('; ') : undefined });
-  appendTradeLog(tel);
+  if (params.dryRun) {
+    const finalStatus: TelemetryStatus = hasSimErrors ? "DRY_RUN_PROFITABLE" : "SIMULATION_SUCCESS";
+    const tel = buildTelemetry({ build: partialResult, direction: params.direction, targetToken, success: !hasSimErrors, status: finalStatus, netProfit,
+      failReason: hasSimErrors ? legs.filter(l => l.simulation.error).map(l => `${l.venue}: ${l.simulation.error}`).join('; ') : undefined });
+    appendTradeLog(tel);
+  } else {
+    console.log(`[TELEMETRY] Live mod — SIMULATION_SUCCESS yazılmadı (execution path telemetriyi yönetecek)`);
+  }
 
   console.log(`[DEBUG] buildAndSimulate tamamlandı — ${legs.length} leg`);
   return partialResult;
@@ -725,6 +744,32 @@ export interface FreshLeg2Result {
 }
 
 /**
+ * Jito bundle başarısız olduğunda Leg1 TX'inin blockhash'ini tazeler ve yeniden imzalar.
+ * Bu, tam bir buildAndSimulate rebuild'den ÇOK DAHA HIZLI (~200ms vs ~3-5s).
+ *
+ * Jito prepareAtomicBundle TX'leri in-place değiştirir (blockhash + imza).
+ * Sequential fallback için sadece taze blockhash + yeni imza yeterlidir —
+ * TX instruction'ları aynı kalır, quote de aynı kalır.
+ */
+export async function refreshLeg1ForSequential(
+  leg1Tx: VersionedTransaction,
+  signer: Keypair,
+): Promise<void> {
+  const connection = getConnection();
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+
+  // Blockhash'i değiştir — eski imzalar geçersiz olur
+  leg1Tx.message.recentBlockhash = blockhash;
+  for (let i = 0; i < leg1Tx.signatures.length; i++) {
+    leg1Tx.signatures[i] = new Uint8Array(64);
+  }
+
+  // Yeniden imzala
+  leg1Tx.sign([signer]);
+  console.log(`[REFRESH-LEG1] Blockhash tazelendi: ${blockhash.slice(0, 16)}… — TX yeniden imzalandı`);
+}
+
+/**
  * Leg 1 on-chain confirm olduktan sonra Leg 2'yi tamamen yeniden oluşturur:
  *  - Taze quote (yeni fiyat)
  *  - Taze blockhash (expire etmez)
@@ -741,20 +786,66 @@ export async function buildFreshLeg2(params: BuildFreshLeg2Params): Promise<Fres
 
   if (params.direction === "JUP_TO_OKX") {
     // Leg 2 = OKX targetToken → USDC
-    console.log(
-      `[FRESH-LEG2] OKX swap-instruction isteniyor (${params.targetToken}→USDC), ` +
-      `amount=${params.leg1ReceivedAmount.toString()}…`
-    );
-    const t0 = Date.now();
-    const { tx, meta } = await buildOkxSwap({
-      inputMint: targetMint,
-      outputMint: usdcMint,
-      amount: params.leg1ReceivedAmount,
-      slippageBps: cfg.slippageBps,
-      userPublicKey: ownerStr,
-    });
-    console.log(`[FRESH-LEG2] OKX TX hazır (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
-    return { tx, meta, venue: "OKX" };
+    // OKX 429 alınırsa Jupiter fallback ile Leg2 dene (unwind'i engelle!)
+    try {
+      console.log(
+        `[FRESH-LEG2] OKX swap-instruction isteniyor (${params.targetToken}→USDC), ` +
+        `amount=${params.leg1ReceivedAmount.toString()}…`
+      );
+      const t0 = Date.now();
+      const { tx, meta } = await buildOkxSwap({
+        inputMint: targetMint,
+        outputMint: usdcMint,
+        amount: params.leg1ReceivedAmount,
+        slippageBps: cfg.slippageBps,
+        userPublicKey: ownerStr,
+      });
+      console.log(`[FRESH-LEG2] OKX TX hazır (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
+      return { tx, meta, venue: "OKX" };
+    } catch (okxErr) {
+      const reason = okxErr instanceof Error ? okxErr.message : String(okxErr);
+      const is429 = reason.includes("429") || reason.includes("Too Many Requests") || reason.includes("rate-limited");
+      if (!is429) throw okxErr; // 429 değilse orijinal hatayı fırlat
+
+      // ── OKX 429 FALLBACK: Jupiter ile Leg2 dene ──
+      // Kâr azalabilir ama emergency unwind'den ÇOKHH daha iyi.
+      console.warn(
+        `[FRESH-LEG2] OKX 429 rate-limited! Jupiter fallback ile Leg2 deneniyor ` +
+        `(${params.targetToken}→USDC)…`
+      );
+      const t0 = Date.now();
+
+      // SOL ise bakiye kontrolü gerekli
+      const isNativeSol = params.targetToken === "SOL";
+      let swapAmount = params.leg1ReceivedAmount;
+      let wrapAndUnwrapSol = !isNativeSol;
+
+      if (isNativeSol) {
+        const solInfo = await resolveSolBalance(
+          params.owner,
+          new PublicKey(targetMint),
+          params.leg1ReceivedAmount
+        );
+        swapAmount = solInfo.swapAmount;
+        wrapAndUnwrapSol = solInfo.wrapAndUnwrapSol;
+      }
+
+      const { route, meta } = await fetchJupiterQuote({
+        inputMint: targetMint,
+        outputMint: usdcMint,
+        amount: swapAmount,
+        slippageBps: cfg.slippageBps,
+      });
+      console.log(`[FRESH-LEG2] Jupiter fallback quote alındı (${Date.now() - t0}ms) — expectedOut=${meta.expectedOut.toString()}`);
+
+      const tx = await buildJupiterSwap({
+        route,
+        userPublicKey: params.owner,
+        wrapAndUnwrapSol,
+      });
+      console.log(`[FRESH-LEG2] ✓ Jupiter fallback TX hazır — OKX 429 atlatıldı`);
+      return { tx, meta, venue: "JUPITER" };
+    }
   } else {
     // Leg 2 = Jupiter targetToken → USDC
     const isNativeSol = params.targetToken === "SOL";

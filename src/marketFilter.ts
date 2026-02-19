@@ -416,3 +416,127 @@ export function getCachedClassification(
   }
   return undefined;
 }
+
+// ── Mint-based Classification (EXPERIMENT_D_READY) ─────────────────
+
+/**
+ * Classify a token pair by raw mint addresses (no TokenSymbol dependency).
+ * Used by EXPERIMENT_D_READY for candidate pair discovery.
+ *
+ * @param baseMint   Base token mint address
+ * @param quoteMint  Quote token mint address (typically USDC)
+ * @param quoteDecimals  Quote token decimals (typically 6)
+ * @param label  Optional label for logging (e.g. "SOL/USDC")
+ * @param forceRefresh  Bypass cache
+ */
+export async function classifyMarketByMint(
+  baseMint: string,
+  quoteMint: string,
+  quoteDecimals: number,
+  label?: string,
+  forceRefresh = false,
+): Promise<MarketClassification> {
+  const cacheKey = `${baseMint}/${quoteMint}`;
+  const tag = label ?? `${baseMint.slice(0, 8)}…/${quoteMint.slice(0, 8)}…`;
+
+  // ── Cache check ──
+  if (!forceRefresh) {
+    const cached = _classificationCache.get(cacheKey);
+    if (cached) {
+      const ttl = CACHE_TTL_BY_TYPE[cached.classification.type] ?? CACHE_TTL_BY_TYPE.UNKNOWN;
+      if (Date.now() - cached.fetchedAt < ttl) {
+        return cached.classification;
+      }
+    }
+  }
+
+  const rejectReasons: string[] = [];
+  const cfg = loadConfig();
+
+  // ── Step 1: Impact sampling ──
+  let impact1k = 0;
+  let impact3k = 0;
+  let impact5k = 0;
+  let routeMarkets = 1;
+
+  try {
+    const [sample1k, sample3k, sample5k] = await Promise.all([
+      sampleImpact(quoteMint, baseMint, IMPACT_SAMPLE_1K, quoteDecimals),
+      sampleImpact(quoteMint, baseMint, IMPACT_SAMPLE_3K, quoteDecimals),
+      sampleImpact(quoteMint, baseMint, IMPACT_SAMPLE_5K, quoteDecimals),
+    ]);
+
+    impact1k = sample1k.impactPct;
+    impact3k = sample3k.impactPct;
+    impact5k = sample5k.impactPct;
+    routeMarkets = Math.max(sample1k.routeMarkets, sample3k.routeMarkets, sample5k.routeMarkets);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    rejectReasons.push(`impact_sampling_failed: ${reason}`);
+    return buildResult("UNKNOWN", { impact1k, impact3k, impact5k, routeMarkets, volume24h: 0, liquidity: 0, volumeLiquidityRatio: 0, slippageCurveRatio: 0, rejectReasons, eligible: false });
+  }
+
+  // ── Step 2: Market data ──
+  let volume24h = 0;
+  let liquidity = 0;
+
+  const birdeyeData = await fetchBirdeyeData(baseMint);
+  if (birdeyeData) {
+    volume24h = birdeyeData.volume24h;
+    liquidity = birdeyeData.liquidity;
+  } else {
+    if (impact3k < 0.1) { volume24h = 1_000_000; liquidity = 10_000_000; }
+    else if (impact3k < 0.5) { volume24h = 100_000; liquidity = 500_000; }
+    else { volume24h = 20_000; liquidity = 50_000; }
+    console.log(`[MARKET-FILTER] Birdeye unavailable for ${tag} — using heuristic (vol=$${volume24h.toLocaleString()}, liq=$${liquidity.toLocaleString()})`);
+  }
+
+  const volumeLiquidityRatio = liquidity > 0 ? volume24h / liquidity : 0;
+  const slippageCurveRatio = impact1k > 0 ? impact5k / impact1k : 0;
+
+  // ── Step 3: Hard reject rules ──
+  if (impact3k > TYPE_B_IMPACT_3K_THRESHOLD) rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% > ${TYPE_B_IMPACT_3K_THRESHOLD}% (shallow liquidity)`);
+  if (volumeLiquidityRatio < MIN_VOL_LIQ_RATIO) rejectReasons.push(`vol/liq=${volumeLiquidityRatio.toFixed(4)} < ${MIN_VOL_LIQ_RATIO}`);
+  if (routeMarkets > MAX_ROUTE_MARKETS) rejectReasons.push(`routeMarkets=${routeMarkets} > ${MAX_ROUTE_MARKETS}`);
+  if (volume24h < MIN_VOLUME_24H) rejectReasons.push(`volume24h=$${volume24h.toFixed(0)} < $${MIN_VOLUME_24H}`);
+  if (impact1k > 0 && slippageCurveRatio > MAX_SLIPPAGE_CURVE_RATIO) rejectReasons.push(`slippage_curve=${slippageCurveRatio.toFixed(2)} > ${MAX_SLIPPAGE_CURVE_RATIO} (liquidity cliff)`);
+  if (liquidity < MIN_LIQUIDITY) rejectReasons.push(`liquidity=$${liquidity.toFixed(0)} < $${MIN_LIQUIDITY} (insufficient depth)`);
+
+  // ── Step 4: Classify ──
+  let type: MarketType;
+  let eligible = false;
+
+  if (rejectReasons.length > 0) {
+    type = impact3k < TYPE_C_IMPACT_3K_MIN ? "A" : "B";
+  } else if (impact3k < TYPE_C_IMPACT_3K_MIN) {
+    type = "A";
+    rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% < ${TYPE_C_IMPACT_3K_MIN}% (Type A — hyper competitive)`);
+  } else if (impact3k >= TYPE_C_IMPACT_3K_MIN && impact3k <= TYPE_C_IMPACT_3K_MAX) {
+    if (slippageCurveRatio <= TYPE_C_SLIPPAGE_CURVE_MAX) {
+      type = "C";
+      eligible = true;
+    } else {
+      type = "B";
+      rejectReasons.push(`slippage_curve=${slippageCurveRatio.toFixed(2)} > ${TYPE_C_SLIPPAGE_CURVE_MAX} (unstable curve for Type C)`);
+    }
+  } else {
+    type = "B";
+    rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% > ${TYPE_C_IMPACT_3K_MAX}% (above Type C sweet spot)`);
+  }
+
+  const classification = buildResult(type, { impact1k, impact3k, impact5k, routeMarkets, volume24h, liquidity, volumeLiquidityRatio, slippageCurveRatio, rejectReasons, eligible });
+
+  // ── Cache ──
+  _classificationCache.set(cacheKey, { classification, fetchedAt: Date.now() });
+
+  const emoji = eligible ? "✓" : "✗";
+  console.log(
+    `[MARKET-FILTER] ${tag} → Type ${type} ${emoji} | ` +
+      `impact: 1k=${impact1k.toFixed(4)}% 3k=${impact3k.toFixed(4)}% 5k=${impact5k.toFixed(4)}% | ` +
+      `routes=${routeMarkets} | vol=$${volume24h.toLocaleString()} | liq=$${liquidity.toLocaleString()} | ` +
+      `v/l=${volumeLiquidityRatio.toFixed(4)} | curve=${slippageCurveRatio.toFixed(2)}` +
+      (rejectReasons.length > 0 ? ` | reject: [${rejectReasons.join("; ")}]` : "")
+  );
+
+  return classification;
+}

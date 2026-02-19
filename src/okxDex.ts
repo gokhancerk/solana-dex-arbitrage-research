@@ -15,14 +15,46 @@ const OKX_FETCH_TIMEOUT_MS = 15_000;
 
 // ── OKX Rate Limiter ────────────────────────────────────────────────
 /** Ardışık OKX API çağrıları arasında minimum bekleme süresi (ms) */
-const OKX_MIN_CALL_SPACING_MS = 1200;
+const OKX_MIN_CALL_SPACING_MS = 2_000;
 /** 429 hatası alındığında max retry sayısı */
 const OKX_429_MAX_RETRIES = 2;
 /** 429 retry backoff base (ms) — exponential: base * 2^(attempt-1) */
-const OKX_429_BACKOFF_BASE_MS = 2000;
+const OKX_429_BACKOFF_BASE_MS = 3_000;
+/** 429 sonrası OKX cooldown süresi (ms) — bu süre boyunca OKX çağrısı yapılmaz */
+const OKX_COOLDOWN_MS = 30_000; // 30 saniye
 
 /** Son OKX API çağrısının TAMAMLANMA timestamp'i */
 let lastOkxCallTimestamp = 0;
+
+/** OKX rate-limit cooldown bitiş zamanı (epoch ms) */
+let _okxRateLimitedUntil = 0;
+
+/**
+ * OKX API çağrısı şu an mümkün mü?
+ * Rate-limit cooldown aktifse false döner — caller OKX'i atlamalıdır.
+ */
+export function isOkxAvailable(): boolean {
+  return Date.now() >= _okxRateLimitedUntil;
+}
+
+/**
+ * OKX cooldown'ın kalan süresi (saniye). 0 = cooldown yok.
+ */
+export function getOkxCooldownRemaining(): number {
+  const remaining = _okxRateLimitedUntil - Date.now();
+  return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+}
+
+/**
+ * OKX cooldown'ını başlat (429 algılandığında çağrılır).
+ */
+function activateOkxCooldown(): void {
+  _okxRateLimitedUntil = Date.now() + OKX_COOLDOWN_MS;
+  console.warn(
+    `[OKX-COOLDOWN] Rate-limited! OKX API ${OKX_COOLDOWN_MS / 1000}s devre dışı — ` +
+    `sadece Jupiter kullanılacak`
+  );
+}
 
 /**
  * Tam seri OKX kuyruğu — throttle + HTTP isteğinin tamamını kapsar.
@@ -93,10 +125,12 @@ async function fetchWithOkx429Retry(
       console.warn(
         `[OKX-RATE] ${label} HTTP 429 alındı (attempt ${attempt + 1}/${OKX_429_MAX_RETRIES + 1}): ${bodyText}`
       );
+      // Cooldown aktifle — sonraki scan'ler OKX'i atlayacak
+      activateOkxCooldown();
       if (attempt === OKX_429_MAX_RETRIES) {
         throw new Error(
           `OKX ${label} rate-limited: 429 Too Many Requests — ` +
-          `${OKX_429_MAX_RETRIES + 1} deneme sonrası başarısız`
+          `${OKX_429_MAX_RETRIES + 1} deneme sonrası başarısız (cooldown ${OKX_COOLDOWN_MS / 1000}s aktif)`
         );
       }
       continue; // retry

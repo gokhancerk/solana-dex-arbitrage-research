@@ -4,6 +4,7 @@ loadDotenv();
 import { startServer } from "./server.js";
 import { PriceTicker } from "./stream/priceTicker.js";
 import { loadConfig } from "./config.js";
+import { runExperimentDReady } from "./experimentDReady.js";
 
 // ─── Ana başlatıcı ──────────────────────────────────────────────────
 // Express API sunucusu (dashboard için) + PriceTicker (bi-directional event-driven döngüsü)
@@ -61,6 +62,19 @@ async function main() {
 
   // 1) Express API sunucusu — her durumda ayağa kalksın
   startServer();
+
+  // ── EXPERIMENT_D_READY modu kontrolü ──
+  const mode = process.env.MODE;
+  if (mode === "EXPERIMENT_D_READY") {
+    console.log(`[START] MODE=EXPERIMENT_D_READY algılandı — pair discovery scanner başlatılıyor`);
+    const maxCycles = process.env.MAX_CYCLES ? Number(process.env.MAX_CYCLES) : 0;
+    const cycleSleep = process.env.CYCLE_SLEEP_SEC ? Number(process.env.CYCLE_SLEEP_SEC) : 30;
+    const pairDelay = process.env.PAIR_DELAY_MS ? Number(process.env.PAIR_DELAY_MS) : 1500;
+    await runExperimentDReady({ maxCycles, cycleSleepSec: cycleSleep, pairDelayMs: pairDelay });
+    console.log(`[START] EXPERIMENT_D_READY tamamlandı — çıkılıyor.`);
+    process.exit(0);
+    return;
+  }
 
   // Dry-run modu bilgilendirmesi
   const cfg = loadConfig();

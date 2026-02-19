@@ -1,6 +1,6 @@
 import { performance } from "perf_hooks";
 import { SlotDriver } from "./slotDriver.js";
-import { Direction, SendError, RealizedPnlInfo, LatencyMetrics, JitoBundleTelemetry } from "../types.js";
+import { Direction, SendError, RealizedPnlInfo, LatencyMetrics, JitoBundleTelemetry, JitoPrepSkipReason, JitoPrepSubTimings, JitoPrepErrorStage } from "../types.js";
 import {
   buildAndSimulate,
   sendWithRetry,
@@ -20,7 +20,7 @@ import { loadConfig, type TokenSymbol, type TradePair } from "../config.js";
 import { tradeLock } from "../tradeLock.js";
 import { waitForConfirmation } from "../solana.js";
 import { takeBalanceSnapshot, computeRealizedPnl, type RealizedPnl } from "../balanceSnapshot.js";
-import { isJitoAvailable, getJitoCooldownRemaining } from "../jito.js";
+import { isJitoAvailable, getJitoCooldownRemaining, prepareAtomicBundle, JitoPrepError, JitoPrepSkip } from "../jito.js";
 import { isMarketEligible, getCachedClassification } from "../marketFilter.js";
 import type { MarketClassification } from "../types.js";
 
@@ -105,8 +105,14 @@ export class PriceTicker {
   start() {
     const cfg = loadConfig();
     const isDryRun = cfg.dryRun;
+    const isExperiment = cfg.experimentJupiterOnly;
+    const isNoSimulate = cfg.experimentNoSimulate;
+    const isJitoPrep = cfg.experimentJitoPrep;
+    const isModeD = isExperiment && !isNoSimulate && isJitoPrep && isDryRun;
+    const experimentLabel = isModeD ? "EXPERIMENT MODE D (SIMULATE_ON + JITO_PREP)" : isJitoPrep ? "EXPERIMENT MODE C (JITO_PREP)" : isNoSimulate ? "EXPERIMENT MODE B (NO_SIMULATE)" : isExperiment ? "EXPERIMENT MODE A (JUPITER_ONLY)" : "";
     console.log(
       `[PriceTicker] ${isDryRun ? "★ DRY-RUN MODU AKTİF — TX gönderilmeyecek ★" : "LIVE MOD"} | ` +
+        (experimentLabel ? `★ ${experimentLabel} ★ | ` : "") +
         `Round-Robin çoklu-token tarama aktif — ` +
         `tokenlar=[${this.scanTokens.join(", ")}], ` +
         `her tick'te tek token, çift yönlü PARALEL` +
@@ -154,6 +160,17 @@ export class PriceTicker {
       let quoteReceivedTimestamp = 0;
       let buildLatencyMs = 0;
       let simulationLatencyMs = 0;
+      let jitoPrepLatencyMs: number | null = null;
+      let jitoPrepAttempted = false;
+      let jitoPrepSkippedReason: JitoPrepSkipReason | undefined;
+      let jitoPrepSubTimings: JitoPrepSubTimings | undefined;
+      let jitoPrepErrorMessage: string | undefined;
+      let jitoPrepErrorCode: string | undefined;
+      let jitoPrepErrorStage: JitoPrepErrorStage | undefined;
+      let jitoPrepRetries: number | undefined;
+      let jitoPrepRetryDelayMsTotal: number | undefined;
+      let jitoPrepTipFetchAttempts: number | undefined;
+      let jitoPrepTipFetchAttemptDurationsMs: number[] | undefined;
       let detectToSendLatencyMs = 0;
       let executionMode: LatencyMetrics["executionMode"] = "SEQUENTIAL";
       let cycleLatencyMetrics: LatencyMetrics | undefined;
@@ -187,12 +204,12 @@ export class PriceTicker {
           }
         }
         // If market is classified and NOT eligible (not Type C), skip this tick
-        // DRY-RUN modda market filter bypass edilir — latency test verisi toplamak için
+        // DRY-RUN veya EXPERIMENT modda market filter bypass edilir — latency test verisi toplamak için
         if (marketClass && !marketClass.eligible) {
-          if (isDryRun) {
+          if (isDryRun || isExperiment) {
             console.log(
-              `[MARKET-FILTER][DRY-RUN-BYPASS] ${pair} → Type ${marketClass.type} ` +
-                `(eligible=false) — dry-run modda filtre ATLANARAK devam ediliyor`
+              `[MARKET-FILTER][${isExperiment ? "EXPERIMENT-BYPASS" : "DRY-RUN-BYPASS"}] ${pair} → Type ${marketClass.type} ` +
+                `(eligible=false) — filtre ATLANARAK devam ediliyor`
             );
           } else {
             console.log(
@@ -207,17 +224,22 @@ export class PriceTicker {
         // ╔══════════════════════════════════════════════════════════════╗
         // ║  ADIM 1 — Round-Robin: bu tick'te tek token, iki yön        ║
         // ║  PARALEL tara (Jupiter & OKX farklı API'lar)                ║
+        // ║  EXPERIMENT MODE A: Sadece JUP_TO_OKX (OKX bypass)         ║
         // ╚══════════════════════════════════════════════════════════════╝
+        const activeDirections: readonly Direction[] = isExperiment
+          ? (["JUP_TO_OKX"] as const)
+          : DIRECTIONS;
+
         console.log(
-          `[SCAN] Slot ${slot} — ${pair} çift yönlü PARALEL quote başlatılıyor ` +
+          `[SCAN] Slot ${slot} — ${pair} ${isExperiment ? "EXPERIMENT (Jupiter-only)" : "çift yönlü PARALEL"} quote başlatılıyor ` +
             `(${notional} USDC)…`
         );
 
         // ── Latency Hook: quote start ──
         const quoteStartMs = performance.now();
 
-        // Paralel: her iki yönü aynı anda tara
-        const quotePromises = DIRECTIONS.map(async (dir) => {
+        // Paralel: tüm aktif yönleri aynı anda tara
+        const quotePromises = activeDirections.map(async (dir) => {
           try {
             const q = await estimateDirectionProfit({
               direction: dir,
@@ -248,11 +270,19 @@ export class PriceTicker {
         // ── SPREAD BUFFER: Estimate aşamasında 1.5x min profit gerekli ──
         // Tahmini kâr her zaman gerçek kârdan ~50% daha iyi çıkıyor (MEV, fiyat kayması).
         // Bu buffer, sadece yeterince geniş spread'lerde trade eden bir filtre ekler.
+        // EXPERIMENT MODE: kârlılık filtresi ATLANIR — sadece latency ölçümü yapılıyor.
         const SPREAD_BUFFER = 1.5;
         const effectiveMinProfit = loadConfig().minNetProfitUsdc * SPREAD_BUFFER;
-        const viable = results.filter(
-          (q): q is QuoteEstimate => q !== null && q.netProfitUsdc >= effectiveMinProfit
-        );
+
+        let viable: QuoteEstimate[];
+        if (isExperiment) {
+          // Experiment modda tüm başarılı sonuçları kabul et (profit irrelevant)
+          viable = results.filter((q): q is QuoteEstimate => q !== null);
+        } else {
+          viable = results.filter(
+            (q): q is QuoteEstimate => q !== null && q.netProfitUsdc >= effectiveMinProfit
+          );
+        }
 
         if (viable.length === 0) {
           // Orijinal viable kontrolü (buffer'sız) ile karşılaştır — bilgilendirme logu
@@ -269,6 +299,43 @@ export class PriceTicker {
             console.log(
               `[SCAN] Slot ${slot} — ${pair} her iki yönde de kârlı rota yok, atlanıyor`
             );
+          }
+
+          // ── EXPERIMENT D: Persist no-opp cycles ──
+          if (isModeD) {
+            const noOppTel = buildTelemetry({
+              build: undefined as any,
+              direction: "JUP_TO_OKX",
+              targetToken,
+              success: false,
+              status: "EXPERIMENT_D_NO_OPP",
+              netProfit: { grossProfitUsdc: 0, feeUsdc: 0, netProfitUsdc: 0 },
+              latencyMetrics: {
+                detectSlot: cycleSlot,
+                detectTimestamp: Date.now(),
+                quoteLatencyMs,
+                buildLatencyMs: 0,
+                simulationLatencyMs: 0,
+                jitoPrepLatencyMs: null,
+                jitoPrepAttempted: false,
+                jitoPrepSkippedReason: undefined,
+                jitoPrepSubTimings: undefined,
+                jitoPrepErrorMessage: undefined,
+                jitoPrepErrorCode: undefined,
+                jitoPrepErrorStage: undefined,
+                jitoPrepRetries: undefined,
+                jitoPrepRetryDelayMsTotal: undefined,
+                detectToSendLatencyMs: 0,
+                executionMode: "JITO",
+                quoteReceivedTimestamp,
+                quoteToSendLatencyMs: 0,
+              },
+              marketClassification: marketClass,
+              expectedNetProfitUsdc: 0,
+              experimentMode: "EXPERIMENT_D",
+            });
+            appendTradeLog(noOppTel);
+            console.log(`[EXPERIMENT-D] NO_OPP telemetrisi yazıldı (quoteLatency=${quoteLatencyMs}ms)`);
           }
           return;
         }
@@ -309,8 +376,16 @@ export class PriceTicker {
         // ── Latency Hook: build+simulate end ──
         const buildEndMs = performance.now();
         buildLatencyMs = Math.round(buildEndMs - buildStartMs);
-        // Simulation is embedded in build — approximate as build time (sim may be skipped in live mode)
-        simulationLatencyMs = buildLatencyMs;
+        // Split timing: if timingSplit is available (Experiment D), use precise split
+        if (result.timingSplit && result.timingSplit.simulateOnlyMs > 0) {
+          buildLatencyMs = result.timingSplit.buildOnlyMs;
+          simulationLatencyMs = result.timingSplit.simulateOnlyMs;
+          console.log(`[EXPERIMENT-D] Split timing — build=${buildLatencyMs}ms, simulate=${simulationLatencyMs}ms, total=${result.timingSplit.totalMs}ms`);
+        } else {
+          // Simulation is embedded in build — approximate as build time (sim may be skipped in live mode)
+          // EXPERIMENT_NO_SIMULATE: simulate atlandı → simulationLatencyMs = 0
+          simulationLatencyMs = isNoSimulate ? 0 : buildLatencyMs;
+        }
 
         // Finalize latency metrics now (detectToSend will be updated before actual send)
         const buildLatencyMetrics = (): LatencyMetrics => {
@@ -323,6 +398,17 @@ export class PriceTicker {
             quoteLatencyMs,
             buildLatencyMs,
             simulationLatencyMs,
+            jitoPrepLatencyMs,
+            jitoPrepAttempted,
+            jitoPrepSkippedReason,
+            jitoPrepSubTimings,
+            jitoPrepErrorMessage,
+            jitoPrepErrorCode,
+            jitoPrepErrorStage,
+            jitoPrepRetries,
+            jitoPrepRetryDelayMsTotal,
+            jitoPrepTipFetchAttempts,
+            jitoPrepTipFetchAttemptDurationsMs,
             detectToSendLatencyMs,
             executionMode,
             quoteReceivedTimestamp,
@@ -330,6 +416,101 @@ export class PriceTicker {
           };
           return cycleLatencyMetrics;
         };
+
+        // ╔══════════════════════════════════════════════════════════════════╗
+        // ║  EXPERIMENT C — Jito bundle prep cost ölçümü (dry-run only)      ║
+        // ║  Bundle hazırlanır ama GÖNDERİLMEZ. Sadece hazırlık latency'si   ║
+        // ║  ölçülür (getLatestBlockhash + getTipAccounts + sign).            ║
+        // ╚══════════════════════════════════════════════════════════════════╝
+        if (isJitoPrep && isDryRun && result.legs.length >= 2) {
+          try {
+            jitoPrepAttempted = true;
+            const jitoPrepStart = performance.now();
+            const bundleData = await prepareAtomicBundle({
+              leg1Tx: result.legs[0].tx,
+              leg2Tx: result.legs[1].tx,
+              signer: this.owner,
+            });
+            jitoPrepLatencyMs = Math.round(performance.now() - jitoPrepStart);
+            jitoPrepSubTimings = bundleData.prepTimings;
+            const tipStats = bundleData.tipFetchStats;
+            // Retry alanları yalnızca gerçek retry varsa set et
+            if (tipStats && tipStats.retries > 0) {
+              jitoPrepRetries = tipStats.retries;
+              jitoPrepRetryDelayMsTotal = tipStats.retryDelayMsTotal;
+            }
+            // Per-attempt breakdown her zaman latency metrics'e yazılsın
+            jitoPrepTipFetchAttempts = tipStats?.attemptCount;
+            jitoPrepTipFetchAttemptDurationsMs = tipStats?.attemptDurationsMs;
+            const tipAttempts = jitoPrepTipFetchAttempts ?? 0;
+            const tipAttemptDurations = jitoPrepTipFetchAttemptDurationsMs ?? [];
+            console.log(
+              `[EXPERIMENT-C][${pair}] Jito bundle prep tamamlandı — ` +
+                `total=${jitoPrepLatencyMs}ms | ` +
+                `blockhash=${jitoPrepSubTimings?.blockhashFetchMs ?? "?"}ms | ` +
+                `tipAccounts=${jitoPrepSubTimings?.tipAccountsFetchMs ?? "?"}ms | ` +
+                `bundleBuild=${jitoPrepSubTimings?.bundleBuildMs ?? "?"}ms | ` +
+                `tipFetch: attempts=${tipAttempts}, cache=${tipStats?.fromCache ?? false}, ` +
+                `retries=${tipStats?.retries ?? 0}, perAttempt=[${tipAttemptDurations.map(d => d + "ms").join(",")}] ` +
+                `(bundle gönderilmedi)`
+            );
+          } catch (err: any) {
+            jitoPrepAttempted = true;
+
+            // JitoPrepSkip — graceful skip (INVALID_TIP_ACCOUNTS vb.)
+            if (err instanceof JitoPrepSkip) {
+              jitoPrepSkippedReason = err.reason;
+              jitoPrepLatencyMs = null;
+              jitoPrepErrorMessage = err.message.length > 300 ? err.message.slice(0, 300) : err.message;
+              if (err.partialTimings) {
+                jitoPrepSubTimings = {
+                  blockhashFetchMs: err.partialTimings.blockhashFetchMs ?? 0,
+                  tipAccountsFetchMs: err.partialTimings.tipAccountsFetchMs ?? 0,
+                  bundleBuildMs: err.partialTimings.bundleBuildMs ?? 0,
+                };
+              }
+              console.warn(
+                `[EXPERIMENT-C][${pair}] Jito bundle prep SKIP: ` +
+                  `reason=${err.reason} | msg=${jitoPrepErrorMessage} | ` +
+                  `tipAccountsFetch=${jitoPrepSubTimings?.tipAccountsFetchMs ?? 0}ms`
+              );
+            } else {
+              // Gerçek hata
+              jitoPrepSkippedReason = "ERROR";
+              jitoPrepLatencyMs = null;
+              const rawMsg = err.message ?? String(err);
+              jitoPrepErrorMessage = rawMsg.length > 300 ? rawMsg.slice(0, 300) : rawMsg;
+              jitoPrepErrorCode = err.code ?? err.name ?? "UNKNOWN";
+              if (err instanceof JitoPrepError) {
+                jitoPrepErrorStage = err.stage;
+                // Kısmi sub-timing'leri de kaydet (hata öncesi tamamlanan adımlar)
+                if (err.partialTimings) {
+                  jitoPrepSubTimings = {
+                    blockhashFetchMs: err.partialTimings.blockhashFetchMs ?? 0,
+                    tipAccountsFetchMs: err.partialTimings.tipAccountsFetchMs ?? 0,
+                    bundleBuildMs: err.partialTimings.bundleBuildMs ?? 0,
+                  };
+                }
+              } else {
+                jitoPrepErrorStage = "UNKNOWN";
+              }
+              console.warn(
+                `[EXPERIMENT-C][${pair}] Jito bundle prep HATA: ` +
+                  `stage=${jitoPrepErrorStage} | code=${jitoPrepErrorCode} | ` +
+                  `msg=${jitoPrepErrorMessage} | ` +
+                  `tipAccountsFetch=${jitoPrepSubTimings?.tipAccountsFetchMs ?? 0}ms`
+              );
+            }
+          }
+        } else if (isJitoPrep) {
+          // Prep istendi ama koşullar sağlanmadı
+          jitoPrepAttempted = false;
+          jitoPrepSkippedReason = !isDryRun ? "NOT_DRY_RUN" : result.legs.length < 2 ? "INSUFFICIENT_LEGS" : "DISABLED";
+        } else {
+          // Experiment C kapalı
+          jitoPrepAttempted = false;
+          jitoPrepSkippedReason = "DISABLED";
+        }
 
         // ╔══════════════════════════════════════════════════════════════╗
         // ║  DRY-RUN GUARD — TX gönderilmez, sadece telemetri yazılır   ║
@@ -354,11 +535,12 @@ export class PriceTicker {
             direction: best.direction,
             targetToken,
             success: true,
-            status: "DRY_RUN_SIM_OK",
+            status: isModeD ? "EXPERIMENT_D_READY" : isJitoPrep ? "EXPERIMENT_JITO_PREP" : isNoSimulate ? "EXPERIMENT_NO_SIMULATE" : isExperiment ? "EXPERIMENT_JUPITER_ONLY" : "DRY_RUN_SIM_OK",
             netProfit: result.netProfit,
             latencyMetrics: buildLatencyMetrics(),
             marketClassification: marketClass,
             expectedNetProfitUsdc,
+            experimentMode: isModeD ? "EXPERIMENT_D" : isJitoPrep ? "JITO_PREP" : isNoSimulate ? "NO_SIMULATE" : isExperiment ? "JUPITER_ONLY" : undefined,
           });
           appendTradeLog(tel);
           return; // dry-run: TX gönderilmez, finally bloğu ile round-robin ilerler

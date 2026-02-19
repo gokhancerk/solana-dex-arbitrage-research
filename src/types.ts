@@ -83,11 +83,23 @@ export interface RealizedPnlInfo {
   postSolLamports: string;
 }
 
+/** Build+Simulate split timing (experiment D: ayrı build vs simulate ölçümü) */
+export interface BuildSimulateTimingSplit {
+  /** TX oluşturma süresi (quote fetch + buildSwap, simulate hariç) (ms) */
+  buildOnlyMs: number;
+  /** RPC simulate süresi (her iki leg toplam) (ms) */
+  simulateOnlyMs: number;
+  /** Tüm build+simulate toplam süresi (ms) */
+  totalMs: number;
+}
+
 export interface BuildSimulateResult {
   direction: Direction;
   legs: SimulatedLeg[];
   quoteMeta: QuoteMeta[];
   netProfit: NetProfitInfo;
+  /** Ayrı build vs simulate zaman ölçümü (sadece experiment mode D'de dolu) */
+  timingSplit?: BuildSimulateTimingSplit;
 }
 
 export interface SendAttempt {
@@ -110,6 +122,14 @@ export type TelemetryStatus =
   | "SIMULATION_FAILED"
   | "DRY_RUN_PROFITABLE"
   | "DRY_RUN_SIM_OK"
+  | "EXPERIMENT_JUPITER_ONLY"
+  | "EXPERIMENT_NO_SIMULATE"
+  | "EXPERIMENT_JITO_PREP"
+  | "EXPERIMENT_D_NO_OPP"
+  | "EXPERIMENT_D_READY"
+  | "EXPERIMENT_D_READY_REJECTED"
+  | "EXPERIMENT_D_READY_NO_OPP"
+  | "EXPERIMENT_D_READY_ERROR"
   | "REJECTED_LOW_PROFIT"
   | "SLIPPAGE_EXCEEDED"
   | "SEND_SUCCESS"
@@ -161,6 +181,8 @@ export interface Telemetry {
   expectedNetProfitUsdc?: number;
   /** Profit drift: realizedPnl - expectedNetProfit. Negative = frontrun/spread close. */
   profitDriftUsdc?: number;
+  /** Experiment mode identifier (e.g. "JUPITER_ONLY", "NO_SIMULATE"). Undefined = normal operation. */
+  experimentMode?: string;
 }
 
 // ───── Market Type Classification ─────
@@ -180,6 +202,23 @@ export interface MarketClassification {
   eligible: boolean;          // true = Type C, can trade
 }
 
+// ───── Jito Prep Sub-Timings ─────
+/** Jito prep hata aşaması */
+export type JitoPrepErrorStage = "BLOCKHASH" | "TIP_ACCOUNTS" | "BUNDLE_BUILD" | "UNKNOWN";
+
+/** Jito prep atlanma nedeni */
+export type JitoPrepSkipReason = "DISABLED" | "NOT_DRY_RUN" | "INSUFFICIENT_LEGS" | "ERROR" | "INVALID_TIP_ACCOUNTS";
+
+/** Jito bundle hazırlama alt adım breakdown'ı */
+export interface JitoPrepSubTimings {
+  /** getLatestBlockhash RPC çağrısı (ms) */
+  blockhashFetchMs: number;
+  /** getJitoTipAccounts çağrısı (ms) */
+  tipAccountsFetchMs: number;
+  /** replaceBlockhash + buildTipTx + sign×3 + extractSignatures (ms) */
+  bundleBuildMs: number;
+}
+
 // ───── Latency Metrics (per-cycle) ─────
 export interface LatencyMetrics {
   detectSlot: number;
@@ -187,6 +226,28 @@ export interface LatencyMetrics {
   quoteLatencyMs: number;
   buildLatencyMs: number;
   simulationLatencyMs: number;
+  /** Jito bundle hazırlama maliyeti (ms). null = prep denenmedi. */
+  jitoPrepLatencyMs: number | null;
+  /** Jito prep fiilen çalıştırıldı mı? */
+  jitoPrepAttempted: boolean;
+  /** Jito prep atlandıysa nedeni */
+  jitoPrepSkippedReason?: JitoPrepSkipReason;
+  /** Jito prep alt adım breakdown (sadece prep başarılıysa dolu) */
+  jitoPrepSubTimings?: JitoPrepSubTimings;
+  /** Jito prep hata mesajı (sadece ERROR durumunda, truncated 300 char) */
+  jitoPrepErrorMessage?: string;
+  /** Jito prep hata kodu (err.code ?? err.name ?? "UNKNOWN") */
+  jitoPrepErrorCode?: string;
+  /** Jito prep hatanın oluştuğu alt adım */
+  jitoPrepErrorStage?: JitoPrepErrorStage;
+  /** Jito prep retry sayısı (tip accounts fetch). undefined = retry olmadı. */
+  jitoPrepRetries?: number;
+  /** Jito prep retry'lerde harcanan toplam bekleme süresi (ms). undefined = retry olmadı. */
+  jitoPrepRetryDelayMsTotal?: number;
+  /** Tip accounts fetch toplam deneme sayısı (ilk dahil) */
+  jitoPrepTipFetchAttempts?: number;
+  /** Her attempt'in süresi (ms) — per-attempt breakdown */
+  jitoPrepTipFetchAttemptDurationsMs?: number[];
   detectToSendLatencyMs: number;
   executionMode: "JITO" | "SEQUENTIAL";
   /** Epoch ms when quote results were received (for stale quote detection) */
@@ -216,4 +277,75 @@ export class NetProfitRejectedError extends Error {
     super(message);
     this.netProfit = netProfit;
   }
+}
+
+// ───── EXPERIMENT_D_READY Record (per-cycle observation) ─────
+
+export type ExperimentDReadyStatus = "READY" | "NO_OPP" | "REJECTED" | "ERROR";
+
+export type ExperimentDOpportunityDirection = "BUY_BASE_SELL_QUOTE" | "BUY_QUOTE_SELL_BASE";
+
+export interface ExperimentDJitoPrep {
+  attempted: boolean;
+  skippedReason: JitoPrepSkipReason | null;
+  latencyMs: number | null;
+  subTimings: {
+    blockhashFetchMs: number | null;
+    tipAccountsFetchMs: number | null;
+    bundleBuildMs: number | null;
+  };
+  retries: number | null;
+  retryDelayMsTotal: number | null;
+  errorStage: JitoPrepErrorStage | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+export interface ExperimentDReadyRecord {
+  /** Epoch ms */
+  ts: number;
+  mode: "EXPERIMENT_D_READY";
+  /** Stable ID: `${baseMint}_${quoteMint}` */
+  pairId: string;
+  baseMint: string;
+  quoteMint: string;
+  baseSymbol?: string;
+  quoteSymbol?: string;
+  status: ExperimentDReadyStatus;
+
+  /** Market classification diagnostics */
+  marketClassification: MarketClassification & {
+    eligible: boolean;
+    rejectReasons: string[];
+  };
+
+  /** Opportunity metrics */
+  opportunity: {
+    notionalUsdc: number;
+    direction: ExperimentDOpportunityDirection;
+    expectedNetProfitUsdc: number;
+    minNetProfitUsdc: number;
+    profitDriftUsdc: number | null;
+    simulatedOutAmountUsdc: number | null;
+  };
+
+  /** Latency metrics */
+  latencyMetrics: {
+    detectSlot: number;
+    detectTimestamp: number;
+    quoteReceivedTimestamp: number;
+    quoteLatencyMs: number;
+    buildLatencyMs: number;
+    simulationLatencyMs: number;
+    detectToSendLatencyMs: number;
+    quoteToSendLatencyMs: number;
+    executionMode: "JITO_PREP";
+  };
+
+  /** Jito prep metrics (prep only, no send) */
+  jitoPrep: ExperimentDJitoPrep;
+
+  /** Error info (only when status=ERROR) */
+  errorMessage?: string;
+  errorCode?: string;
 }

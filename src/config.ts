@@ -59,6 +59,12 @@ export interface AppConfig {
   jitoTipLamports: number;
   /** Dry-run modu: TX gönderilmez, sadece quote + simulate yapılır. Env: DRY_RUN=true */
   dryRun: boolean;
+  /** Experiment Mode A: OKX bypass — sadece Jupiter quote + build/simulate. Env: EXPERIMENT_JUPITER_ONLY=true */
+  experimentJupiterOnly: boolean;
+  /** Experiment Mode B: Simulate bypass — build yap ama simulate çağırma. Env: EXPERIMENT_NO_SIMULATE=true */
+  experimentNoSimulate: boolean;
+  /** Experiment Mode C: Jito prep cost — bundle hazırlama maliyetini ölç (dry-run). Env: EXPERIMENT_JITO_PREP=true */
+  experimentJitoPrep: boolean;
 }
 
 export const DEFAULT_SLIPPAGE_BPS = 10; // 0.1%
@@ -83,6 +89,12 @@ export const DEFAULT_JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.
 export const DEFAULT_JITO_TIP_LAMPORTS = 10_000;
 /** Dry-run modu varsayılan: aktif — mainnet gönderim kapalı */
 export const DEFAULT_DRY_RUN = true;
+/** Experiment Mode A varsayılan: kapalı */
+export const DEFAULT_EXPERIMENT_JUPITER_ONLY = true;
+/** Experiment Mode B varsayılan: kapalı */
+export const DEFAULT_EXPERIMENT_NO_SIMULATE = false;
+/** Experiment Mode C varsayılan: kapalı */
+export const DEFAULT_EXPERIMENT_JITO_PREP = true;
 
 function requireEnv(name: string, optional = false): string | undefined {
   const v = process.env[name];
@@ -162,6 +174,9 @@ export function loadConfig(): AppConfig {
         ],
     jitoTipLamports: Number(process.env.JITO_TIP_LAMPORTS ?? DEFAULT_JITO_TIP_LAMPORTS),
     dryRun: (process.env.DRY_RUN ?? String(DEFAULT_DRY_RUN)) === "true",
+    experimentJupiterOnly: (process.env.EXPERIMENT_JUPITER_ONLY ?? String(DEFAULT_EXPERIMENT_JUPITER_ONLY)) === "true",
+    experimentNoSimulate: (process.env.EXPERIMENT_NO_SIMULATE ?? String(DEFAULT_EXPERIMENT_NO_SIMULATE)) === "true",
+    experimentJitoPrep: (process.env.EXPERIMENT_JITO_PREP ?? String(DEFAULT_EXPERIMENT_JITO_PREP)) === "true",
     tokens
   };
 }

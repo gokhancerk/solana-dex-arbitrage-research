@@ -14,7 +14,9 @@
     "airdrop:devnet": "tsx src/airdrop.ts",
     "convert-key": "tsx src/scripts/convertKey.ts",
     "dashboard": "cd dashboard && npm run dev",
-    "dashboard:build": "cd dashboard && npm run build"
+    "dashboard:build": "cd dashboard && npm run build",
+    "experiment:d-ready": "DRY_RUN=true MODE=EXPERIMENT_D_READY EXPERIMENT_JUPITER_ONLY=true EXPERIMENT_NO_SIMULATE=false EXPERIMENT_JITO_PREP=true npm start",
+    "analyze:d-ready": "tsx src/scripts/analyzeExperimentDReady.ts"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",

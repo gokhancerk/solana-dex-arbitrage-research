@@ -43,6 +43,8 @@ export interface BuildTelemetryParams {
   marketClassification?: MarketClassification;
   /** Pre-send estimated net profit (from quote + fees) for drift analysis */
   expectedNetProfitUsdc?: number;
+  /** Experiment mode identifier (e.g. "JUPITER_ONLY"). Undefined = normal operation. */
+  experimentMode?: string;
 }
 
 export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
@@ -61,6 +63,7 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
     jitoBundleTelemetry,
     marketClassification,
     expectedNetProfitUsdc,
+    experimentMode,
   } = params;
 
   const pair: TradePair = `${targetToken}/USDC` as TradePair;
@@ -109,6 +112,7 @@ export function buildTelemetry(params: BuildTelemetryParams): Telemetry {
     marketClassification,
     expectedNetProfitUsdc,
     profitDriftUsdc: computeProfitDrift(expectedNetProfitUsdc, realizedPnl),
+    experimentMode,
   };
 }
 
@@ -137,6 +141,14 @@ const PERSISTABLE_STATUSES: ReadonlySet<TelemetryStatus> = new Set([
   "SIMULATION_SUCCESS",
   "DRY_RUN_SIM_OK",
   "DRY_RUN_PROFITABLE",
+  "EXPERIMENT_JUPITER_ONLY",
+  "EXPERIMENT_NO_SIMULATE",
+  "EXPERIMENT_JITO_PREP",
+  "EXPERIMENT_D_NO_OPP",
+  "EXPERIMENT_D_READY",
+  "EXPERIMENT_D_READY_REJECTED",
+  "EXPERIMENT_D_READY_NO_OPP",
+  "EXPERIMENT_D_READY_ERROR",
   "REJECTED_LOW_PROFIT",
   "SEND_SUCCESS",
   "EMERGENCY_UNWIND_SUCCESS",

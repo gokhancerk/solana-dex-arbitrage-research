@@ -5,16 +5,6 @@
   "quoteDecimals": 6,
   "candidates": [
     {
-      "mint": "So11111111111111111111111111111111111111112",
-      "symbol": "SOL",
-      "decimals": 9
-    },
-    {
-      "mint": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
-      "symbol": "JUP",
-      "decimals": 6
-    },
-    {
       "mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
       "symbol": "WIF",
       "decimals": 6

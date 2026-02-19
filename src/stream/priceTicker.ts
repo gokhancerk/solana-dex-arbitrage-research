@@ -1,6 +1,6 @@
 import { performance } from "perf_hooks";
 import { SlotDriver } from "./slotDriver.js";
-import { Direction, SendError, RealizedPnlInfo } from "../types.js";
+import { Direction, SendError, RealizedPnlInfo, LatencyMetrics, JitoBundleTelemetry } from "../types.js";
 import {
   buildAndSimulate,
   sendWithRetry,
@@ -11,6 +11,7 @@ import {
   emergencyUnwind,
   resolvePriorityFee,
   executeAtomicArbitrage,
+  refreshLeg1ForSequential,
 } from "../execution.js";
 import { buildTelemetry, appendTradeLog } from "../telemetry.js";
 import { Keypair } from "@solana/web3.js";
@@ -20,6 +21,8 @@ import { tradeLock } from "../tradeLock.js";
 import { waitForConfirmation } from "../solana.js";
 import { takeBalanceSnapshot, computeRealizedPnl, type RealizedPnl } from "../balanceSnapshot.js";
 import { isJitoAvailable, getJitoCooldownRemaining } from "../jito.js";
+import { isMarketEligible, getCachedClassification } from "../marketFilter.js";
+import type { MarketClassification } from "../types.js";
 
 /** Her döngüde taranacak iki yön */
 const DIRECTIONS: readonly Direction[] = ["JUP_TO_OKX", "OKX_TO_JUP"] as const;
@@ -100,13 +103,18 @@ export class PriceTicker {
   }
 
   start() {
+    const cfg = loadConfig();
+    const isDryRun = cfg.dryRun;
     console.log(
-      `[PriceTicker] Round-Robin çoklu-token tarama aktif — ` +
+      `[PriceTicker] ${isDryRun ? "★ DRY-RUN MODU AKTİF — TX gönderilmeyecek ★" : "LIVE MOD"} | ` +
+        `Round-Robin çoklu-token tarama aktif — ` +
         `tokenlar=[${this.scanTokens.join(", ")}], ` +
         `her tick'te tek token, çift yönlü PARALEL` +
-        (loadConfig().useJitoBundle
-          ? ` | ★ JITO BUNDLE AKTİF (atomik çalışma)`
-          : ` | Sequential mod (Leg1→confirm→Leg2)`)
+        (isDryRun
+          ? ``
+          : cfg.useJitoBundle
+            ? ` | ★ JITO BUNDLE AKTİF (atomik çalışma)`
+            : ` | Sequential mod (Leg1→confirm→Leg2)`)
     );
     this.slotDriver.start();
 
@@ -136,6 +144,23 @@ export class PriceTicker {
       const targetToken = this.currentToken;
       const pair: TradePair = pairFromToken(targetToken);
 
+      // ── Latency Instrumentation ──
+      // detectSlot/detectTimestamp are set AFTER a profitable opportunity
+      // is confirmed (not at cycle start) to avoid inflated D2S metrics.
+      const cycleSlot = slot;
+      let detectSlot = slot;
+      let detectTimestamp = 0;
+      let quoteLatencyMs = 0;
+      let quoteReceivedTimestamp = 0;
+      let buildLatencyMs = 0;
+      let simulationLatencyMs = 0;
+      let detectToSendLatencyMs = 0;
+      let executionMode: LatencyMetrics["executionMode"] = "SEQUENTIAL";
+      let cycleLatencyMetrics: LatencyMetrics | undefined;
+      let cycleJitoBundleTelemetry: JitoBundleTelemetry | undefined;
+      let marketClass: MarketClassification | undefined;
+      let expectedNetProfitUsdc: number | undefined;
+
       try {
         const ownerStr = this.owner.publicKey.toBase58();
         const notional = this.notionalUsd;
@@ -146,6 +171,40 @@ export class PriceTicker {
         await resolvePriorityFee();
 
         // ╔══════════════════════════════════════════════════════════════╗
+        // ║  ADIM 0.5 — Market Type Filter (Type C gating)              ║
+        // ║  Only Type C markets are eligible for live execution.        ║
+        // ║  Classification is cached (60s TTL) — minimal overhead.      ║
+        // ╚══════════════════════════════════════════════════════════════╝
+        marketClass = getCachedClassification(targetToken);
+        if (!marketClass) {
+          try {
+            marketClass = await isMarketEligible(targetToken);
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            console.warn(
+              `[MARKET-FILTER] ${pair} classification hatası: ${reason} — filtre atlanıyor`
+            );
+          }
+        }
+        // If market is classified and NOT eligible (not Type C), skip this tick
+        // DRY-RUN modda market filter bypass edilir — latency test verisi toplamak için
+        if (marketClass && !marketClass.eligible) {
+          if (isDryRun) {
+            console.log(
+              `[MARKET-FILTER][DRY-RUN-BYPASS] ${pair} → Type ${marketClass.type} ` +
+                `(eligible=false) — dry-run modda filtre ATLANARAK devam ediliyor`
+            );
+          } else {
+            console.log(
+              `[MARKET-FILTER][SKIP] ${pair} → Type ${marketClass.type} (eligible=false) — ` +
+                `impact_3k=${marketClass.impact3k.toFixed(4)}% | ` +
+                `reject: [${marketClass.rejectReasons.join("; ")}] — atlanıyor`
+            );
+            return;
+          }
+        }
+
+        // ╔══════════════════════════════════════════════════════════════╗
         // ║  ADIM 1 — Round-Robin: bu tick'te tek token, iki yön        ║
         // ║  PARALEL tara (Jupiter & OKX farklı API'lar)                ║
         // ╚══════════════════════════════════════════════════════════════╝
@@ -153,6 +212,9 @@ export class PriceTicker {
           `[SCAN] Slot ${slot} — ${pair} çift yönlü PARALEL quote başlatılıyor ` +
             `(${notional} USDC)…`
         );
+
+        // ── Latency Hook: quote start ──
+        const quoteStartMs = performance.now();
 
         // Paralel: her iki yönü aynı anda tara
         const quotePromises = DIRECTIONS.map(async (dir) => {
@@ -178,6 +240,10 @@ export class PriceTicker {
         });
 
         const results = await Promise.all(quotePromises);
+
+        // ── Latency Hook: quote end ──
+        quoteLatencyMs = Math.round(performance.now() - quoteStartMs);
+        quoteReceivedTimestamp = Date.now();
 
         // ── SPREAD BUFFER: Estimate aşamasında 1.5x min profit gerekli ──
         // Tahmini kâr her zaman gerçek kârdan ~50% daha iyi çıkıyor (MEV, fiyat kayması).
@@ -218,17 +284,85 @@ export class PriceTicker {
             `Tahmini net kâr: ${best.netProfitUsdc.toFixed(6)} USDC`
         );
 
+        // ── Latency Hook: DETECT POINT ──
+        // Detect = profitable opportunity identified (NOT tick start).
+        // This is the correct measurement point for D2S latency.
+        detectSlot = cycleSlot;
+        detectTimestamp = Date.now();
+        expectedNetProfitUsdc = best.netProfitUsdc;
+
         // ╔══════════════════════════════════════════════════════════════╗
         // ║  ADIM 3 — Tam build + simulate (kazanan yön)               ║
         // ╚══════════════════════════════════════════════════════════════╝
+        // ── Latency Hook: build+simulate start ──
+        const buildStartMs = performance.now();
+
         let result = await buildAndSimulate({
           direction: best.direction,
           notionalUsd: notional,
           owner: this.owner.publicKey,
           targetToken,
-          dryRun: false,
+          dryRun: isDryRun,
           cachedEstimate: best,
         });
+
+        // ── Latency Hook: build+simulate end ──
+        const buildEndMs = performance.now();
+        buildLatencyMs = Math.round(buildEndMs - buildStartMs);
+        // Simulation is embedded in build — approximate as build time (sim may be skipped in live mode)
+        simulationLatencyMs = buildLatencyMs;
+
+        // Finalize latency metrics now (detectToSend will be updated before actual send)
+        const buildLatencyMetrics = (): LatencyMetrics => {
+          const sendTimestamp = Date.now();
+          detectToSendLatencyMs = sendTimestamp - detectTimestamp;
+          const quoteToSendMs = sendTimestamp - quoteReceivedTimestamp;
+          cycleLatencyMetrics = {
+            detectSlot,
+            detectTimestamp,
+            quoteLatencyMs,
+            buildLatencyMs,
+            simulationLatencyMs,
+            detectToSendLatencyMs,
+            executionMode,
+            quoteReceivedTimestamp,
+            quoteToSendLatencyMs: quoteToSendMs,
+          };
+          return cycleLatencyMetrics;
+        };
+
+        // ╔══════════════════════════════════════════════════════════════╗
+        // ║  DRY-RUN GUARD — TX gönderilmez, sadece telemetri yazılır   ║
+        // ╚══════════════════════════════════════════════════════════════╝
+        if (isDryRun) {
+          console.log(
+            `[DRY-RUN][${pair}][${dirLabel(best.direction)}] Simülasyon tamamlandı — ` +
+              `net kâr: ${result.netProfit.netProfitUsdc.toFixed(6)} USDC | ` +
+              `TX gönderilmiyor (dry-run modu aktif)`
+          );
+          result.legs.forEach((leg, idx) => {
+            const status = leg.simulation.error ? "⚠ SIM HATASI" : "✓ SIM OK";
+            console.log(
+              `[DRY-RUN]  Leg ${idx + 1}: ${leg.venue} ${status} | ` +
+                `expectedOut=${leg.expectedOut} | ` +
+                `simulatedOut=${leg.simulatedOut ?? "n/a"} | ` +
+                `slippageBps=${leg.effectiveSlippageBps ?? "n/a"}`
+            );
+          });
+          const tel = buildTelemetry({
+            build: result,
+            direction: best.direction,
+            targetToken,
+            success: true,
+            status: "DRY_RUN_SIM_OK",
+            netProfit: result.netProfit,
+            latencyMetrics: buildLatencyMetrics(),
+            marketClassification: marketClass,
+            expectedNetProfitUsdc,
+          });
+          appendTradeLog(tel);
+          return; // dry-run: TX gönderilmez, finally bloğu ile round-robin ilerler
+        }
 
         // ╔══════════════════════════════════════════════════════════════╗
         // ║  ADIM 4 — LIVE EXECUTION                                      ║
@@ -273,6 +407,7 @@ export class PriceTicker {
           // ║  Leg1 + Leg2 + Tip → tek bundle → aynı blokta           ║
           // ║  Emergency unwind sadece çok nadir Leg1-only durumda     ║
           // ═══════════════════════════════════════════════════════════
+          executionMode = "JITO";
           console.log(
             `[JITO][${pair}][${dirLabel(best.direction)}] Atomik bundle gönderiliyor…`
           );
@@ -305,6 +440,29 @@ export class PriceTicker {
             }
 
             // Telemetri: Jito başarılı
+            // ── Jito Bundle Telemetry ──
+            const bundleSendTimestamp = detectTimestamp + quoteLatencyMs + buildLatencyMs;
+            const bundleLandingSlot = atomicResult.landedSlot ?? null;
+            const bundleSendSlot = detectSlot;  // approximate — may be a few slots later
+            const bundleLatencyMs = bundleLandingSlot
+              ? Math.round(Date.now() - bundleSendTimestamp)
+              : 0;
+            const bundleInclusionDelaySlots = bundleLandingSlot
+              ? bundleLandingSlot - bundleSendSlot
+              : 0;
+            cycleJitoBundleTelemetry = {
+              bundleSendSlot,
+              bundleSendTimestamp,
+              bundleLandingSlot,
+              bundleStatus: "LANDED",
+              bundleLatencyMs,
+              bundleInclusionDelaySlots,
+            };
+            if (bundleInclusionDelaySlots > 1) {
+              console.warn(
+                `[JITO-MEV] Bundle inclusion delay: ${bundleInclusionDelaySlots} slots — MEV race riski!`
+              );
+            }
             const tel = buildTelemetry({
               build: result,
               direction: best.direction,
@@ -314,6 +472,10 @@ export class PriceTicker {
               status: "JITO_BUNDLE_LANDED",
               netProfit: result.netProfit,
               realizedPnl: realizedPnlInfo,
+              latencyMetrics: buildLatencyMetrics(),
+              jitoBundleTelemetry: cycleJitoBundleTelemetry,
+              marketClassification: marketClass,
+              expectedNetProfitUsdc,
             });
             appendTradeLog(tel);
             console.log(
@@ -327,6 +489,14 @@ export class PriceTicker {
             );
 
             // Telemetri: Jito kısmi başarısızlık
+            cycleJitoBundleTelemetry = {
+              bundleSendSlot: detectSlot,
+              bundleSendTimestamp: detectTimestamp + quoteLatencyMs + buildLatencyMs,
+              bundleLandingSlot: null,
+              bundleStatus: "FAILED",
+              bundleLatencyMs: 0,
+              bundleInclusionDelaySlots: 0,
+            };
             const failTel = buildTelemetry({
               build: result,
               direction: best.direction,
@@ -336,6 +506,10 @@ export class PriceTicker {
               status: "JITO_BUNDLE_FAILED",
               failReason: atomicResult.failReason ?? "Leg1 on-chain, Leg2 failed in bundle",
               netProfit: result.netProfit,
+              latencyMetrics: buildLatencyMetrics(),
+              jitoBundleTelemetry: cycleJitoBundleTelemetry,
+              marketClassification: marketClass,
+              expectedNetProfitUsdc,
             });
             appendTradeLog(failTel);
 
@@ -395,29 +569,52 @@ export class PriceTicker {
               status: "JITO_BUNDLE_FAILED",
               failReason: atomicResult.failReason ?? "Bundle failed → sequential fallback",
               netProfit: result.netProfit,
+              latencyMetrics: buildLatencyMetrics(),
+              expectedNetProfitUsdc,
+              jitoBundleTelemetry: {
+                bundleSendSlot: detectSlot,
+                bundleSendTimestamp: detectTimestamp + quoteLatencyMs + buildLatencyMs,
+                bundleLandingSlot: null,
+                bundleStatus: "FAILED",
+                bundleLatencyMs: 0,
+                bundleInclusionDelaySlots: 0,
+              },
+              marketClassification: marketClass,
             });
             appendTradeLog(failTel);
 
             // Jito prepareAtomicBundle TX'leri in-place değiştirdi (blockhash + sign).
-            // Sequential path için TAM YENİ legs gerekiyor.
+            // Tam rebuild yerine SADECE blockhash taze + re-sign yaparak ~200ms'de sequential'a geç.
+            // Tam rebuild (buildAndSimulate) 3-5s sürer ve spread kapanır.
             try {
-              result = await buildAndSimulate({
-                direction: best.direction,
-                notionalUsd: notional,
-                owner: this.owner.publicKey,
-                targetToken,
-                dryRun: false,
-                // cachedEstimate kullanmıyoruz — taze quote gerekli
-              });
+              await refreshLeg1ForSequential(result.legs[0].tx, this.owner);
               console.log(
-                `[JITO-FALLBACK][${pair}] Taze legs oluşturuldu — sequential devam ediyor`
+                `[JITO-FALLBACK][${pair}] Leg1 TX blockhash tazelendi — sequential devam ediyor`
               );
-            } catch (rebuildErr) {
-              const reason = rebuildErr instanceof Error ? rebuildErr.message : String(rebuildErr);
+            } catch (refreshErr) {
+              const reason = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
               console.error(
-                `[JITO-FALLBACK][${pair}] Sequential rebuild BAŞARISIZ: ${reason}`
+                `[JITO-FALLBACK][${pair}] Leg1 refresh BAŞARISIZ: ${reason} — tam rebuild deneniyor…`
               );
-              executedSuccessfully = true; // prevent sequential with stale data
+              // Refresh başarısızsa tam rebuild dene
+              try {
+                result = await buildAndSimulate({
+                  direction: best.direction,
+                  notionalUsd: notional,
+                  owner: this.owner.publicKey,
+                  targetToken,
+                  dryRun: isDryRun,
+                });
+                console.log(
+                  `[JITO-FALLBACK][${pair}] Tam rebuild başarılı — sequential devam ediyor`
+                );
+              } catch (rebuildErr) {
+                const rr = rebuildErr instanceof Error ? rebuildErr.message : String(rebuildErr);
+                console.error(
+                  `[JITO-FALLBACK][${pair}] Tam rebuild de BAŞARISIZ: ${rr}`
+                );
+                executedSuccessfully = true; // prevent sequential with stale data
+              }
             }
           }
         }
@@ -531,6 +728,9 @@ export class PriceTicker {
             status: "SEND_SUCCESS",
             netProfit: result.netProfit,
             realizedPnl: realizedPnlInfo,
+            latencyMetrics: buildLatencyMetrics(),
+            marketClassification: marketClass,
+            expectedNetProfitUsdc,
           });
           appendTradeLog(tel);
           console.log(
@@ -557,6 +757,9 @@ export class PriceTicker {
             status: "LEG2_REFRESH_FAILED",
             failReason: "Leg 2 send failed after fresh rebuild — triggering emergency unwind",
             netProfit: result.netProfit,
+            latencyMetrics: buildLatencyMetrics(),
+            marketClassification: marketClass,
+            expectedNetProfitUsdc,
           });
           appendTradeLog(failTel);
 
@@ -625,11 +828,21 @@ export class PriceTicker {
         tradeLock.release();
         const endMs = performance.now();
         const latencyMs = Math.round(endMs - startMs);
+        const d2s = Date.now() - detectTimestamp;
         console.info(
           `[LATENCY] Slot: ${slot} | Pair: ${pair} | E2E Cycle: ${latencyMs}ms | ` +
+            `Quote: ${quoteLatencyMs}ms | Build: ${buildLatencyMs}ms | ` +
+            `D2S: ${d2s}ms | Mode: ${executionMode} | ` +
             `Sonraki: ${pairFromToken(this.currentToken)} | ` +
             `Tokens: [${this.scanTokens.join(",")}]`
         );
+        // Latency warning for Type A markets
+        if (d2s > 800) {
+          console.warn(
+            `[LATENCY-WARN] detectToSend ${d2s}ms > 800ms — ` +
+              `Type A markets'ta MEV race kaybedilir. Pair: ${pair}`
+          );
+        }
       }
     });
   }

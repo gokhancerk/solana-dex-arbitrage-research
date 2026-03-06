@@ -200,6 +200,8 @@ export interface MarketClassification {
   slippageCurveRatio: number; // impact_5k / impact_1k
   rejectReasons: string[];    // empty = accepted
   eligible: boolean;          // true = Type C, can trade
+  /** true when routeMarkets=4 (research-eligible but too complex for live execution cap of 3) */
+  complexRoute?: boolean;
 }
 
 // ───── Jito Prep Sub-Timings ─────
@@ -312,6 +314,17 @@ export interface ExperimentDReadyRecord {
   baseSymbol?: string;
   quoteSymbol?: string;
   status: ExperimentDReadyStatus;
+
+  /** Pool metadata from discovery v2 (sourceDex, poolType, etc.) */
+  poolMeta?: {
+    sourceDex: string;
+    poolType: string;
+    poolId: string;
+    feeBps: number;
+    liqUsd: number;
+    vol24hUsd: number;
+    isDirectUsdcPool?: boolean;
+  };
 
   /** Market classification diagnostics */
   marketClassification: MarketClassification & {

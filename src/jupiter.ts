@@ -1,10 +1,11 @@
-import { VersionedTransaction, PublicKey } from "@solana/web3.js";
+import { VersionedTransaction, PublicKey, TransactionInstruction, AddressLookupTableAccount } from "@solana/web3.js";
 import { loadConfig } from "./config.js";
 import { QuoteMeta, SimulationOutcome } from "./types.js";
 import { simulateTx } from "./solana.js";
 
 const JUP_QUOTE_URL = "https://api.jup.ag/swap/v1/quote";
 const JUP_SWAP_URL = "https://api.jup.ag/swap/v1/swap";
+const JUP_SWAP_INSTRUCTIONS_URL = "https://api.jup.ag/swap/v1/swap-instructions";
 
 export interface JupiterRouteInfo {
   inputMint: string;
@@ -31,6 +32,10 @@ export interface JupiterQuoteParams {
   outputMint: string;
   amount: bigint; // raw units
   slippageBps: number;
+  /** Optional: filter to specific DEX protocols (e.g., "Whirlpool", "Raydium,RaydiumCLMM") */
+  dexes?: string;
+  /** Optional: only direct routes (no intermediate tokens) */
+  onlyDirectRoutes?: boolean;
 }
 
 export interface JupiterSwapParams {
@@ -49,14 +54,17 @@ export interface JupiterSwapParams {
 }
 
 export async function fetchJupiterQuote(params: JupiterQuoteParams): Promise<{ route: JupiterRouteInfo; meta: QuoteMeta }> {
-  const { inputMint, outputMint, amount, slippageBps } = params;
+  const { inputMint, outputMint, amount, slippageBps, dexes, onlyDirectRoutes } = params;
   const url = new URL(JUP_QUOTE_URL);
   url.searchParams.set("inputMint", inputMint);
   url.searchParams.set("outputMint", outputMint);
   url.searchParams.set("amount", amount.toString());
   url.searchParams.set("slippageBps", slippageBps.toString());
-  url.searchParams.set("onlyDirectRoutes", "false");
+  url.searchParams.set("onlyDirectRoutes", onlyDirectRoutes === true ? "true" : "false");
   url.searchParams.set("restrictIntermediateTokens", "true");
+  if (dexes) {
+    url.searchParams.set("dexes", dexes);
+  }
 
   const cfg = loadConfig();
   if (!cfg.jupiterApiKey) {
@@ -134,4 +142,103 @@ export function computeSlippageBps(expectedOut: bigint, simulatedOut?: bigint): 
   if (!simulatedOut || expectedOut === BigInt(0)) return undefined;
   const delta = Number(expectedOut - simulatedOut);
   return Math.max(0, Math.round((delta * 10000) / Number(expectedOut)));
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Swap Instructions API (for atomic multi-swap TX)
+// ══════════════════════════════════════════════════════════════
+
+interface SerializedInstruction {
+  programId: string;
+  accounts: { pubkey: string; isSigner: boolean; isWritable: boolean }[];
+  data: string;
+}
+
+export interface JupiterSwapInstructionsResponse {
+  tokenLedgerInstruction?: SerializedInstruction;
+  computeBudgetInstructions: SerializedInstruction[];
+  setupInstructions: SerializedInstruction[];
+  swapInstruction: SerializedInstruction;
+  cleanupInstruction?: SerializedInstruction;
+  otherInstructions: SerializedInstruction[];
+  addressLookupTableAddresses: string[];
+}
+
+export interface JupiterSwapInstructionsParams {
+  route: JupiterRouteInfo;
+  userPublicKey: PublicKey;
+  wrapAndUnwrapSol?: boolean;
+  /** Skip compute budget - we'll add our own unified budget */
+  skipComputeBudget?: boolean;
+}
+
+/**
+ * Deserialize a Jupiter serialized instruction into a TransactionInstruction
+ */
+export function deserializeInstruction(ix: SerializedInstruction): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: new PublicKey(ix.programId),
+    keys: ix.accounts.map((acc) => ({
+      pubkey: new PublicKey(acc.pubkey),
+      isSigner: acc.isSigner,
+      isWritable: acc.isWritable,
+    })),
+    data: Buffer.from(ix.data, "base64"),
+  });
+}
+
+/**
+ * Fetch swap instructions from Jupiter (instead of a full transaction).
+ * This allows merging multiple swaps into a single atomic transaction.
+ */
+export async function fetchJupiterSwapInstructions(
+  params: JupiterSwapInstructionsParams
+): Promise<{
+  setupInstructions: TransactionInstruction[];
+  swapInstruction: TransactionInstruction;
+  cleanupInstruction?: TransactionInstruction;
+  addressLookupTableAddresses: string[];
+}> {
+  const cfg = loadConfig();
+  const body = {
+    quoteResponse: params.route,
+    userPublicKey: params.userPublicKey.toBase58(),
+    wrapAndUnwrapSol: params.wrapAndUnwrapSol ?? true,
+    useSharedAccounts: true,
+    // We don't want Jupiter's compute budget - we'll set our own
+    dynamicComputeUnitLimit: false,
+    prioritizationFeeLamports: 0,
+  };
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (cfg.jupiterApiKey) {
+    headers["x-api-key"] = cfg.jupiterApiKey;
+  }
+
+  const res = await fetch(JUP_SWAP_INSTRUCTIONS_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`Jupiter swap-instructions failed: ${res.status} ${res.statusText} – ${errBody}`);
+  }
+
+  const json = (await res.json()) as JupiterSwapInstructionsResponse;
+
+  // Deserialize instructions
+  const setupInstructions = json.setupInstructions.map(deserializeInstruction);
+  const swapInstruction = deserializeInstruction(json.swapInstruction);
+  const cleanupInstruction = json.cleanupInstruction
+    ? deserializeInstruction(json.cleanupInstruction)
+    : undefined;
+
+  return {
+    setupInstructions,
+    swapInstruction,
+    cleanupInstruction,
+    addressLookupTableAddresses: json.addressLookupTableAddresses,
+  };
 }

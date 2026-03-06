@@ -1,47 +1,411 @@
 {
-  "_comment": "Candidate base token mints for EXPERIMENT_D_READY pair discovery. Quote currency is always USDC.",
+  "generatedAtMs": 1771610340814,
+  "version": "discovery_v2",
   "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
   "quoteSymbol": "USDC",
   "quoteDecimals": 6,
   "candidates": [
     {
-      "mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
-      "symbol": "WIF",
+      "baseMint": "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA",
+      "sourceDex": "orca",
+      "poolId": "AxqAWNZqozhTn2pkDPgpf5kc5DeBuhLKKNWnt3dLrxdi",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 422292,
+      "poolVolume24hUsd": 1732784,
+      "feeBps": 1,
+      "tickSpacing": 1,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA",
+      "symbol": "USDS",
       "decimals": 6
     },
     {
-      "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-      "symbol": "BONK",
-      "decimals": 5
-    },
-    {
-      "mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
-      "symbol": "PYTH",
+      "baseMint": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+      "sourceDex": "orca",
+      "poolId": "6nD6d8gG17wakW6Wu5URktBZQp3uxp5orgPa576QXigJ",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 760971,
+      "poolVolume24hUsd": 847880,
+      "feeBps": 16,
+      "tickSpacing": 16,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+      "symbol": "TRUMP",
       "decimals": 6
     },
     {
-      "mint": "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk",
-      "symbol": "WEN",
-      "decimals": 5
+      "baseMint": "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr",
+      "sourceDex": "orca",
+      "poolId": "AgeSxtVWWMojFWYNrXKnVp9cFuC5CQ7M4rzmrseLxfUj",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 356000,
+      "poolVolume24hUsd": 842252,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr",
+      "symbol": "SPX",
+      "decimals": 8
     },
     {
+      "baseMint": "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
+      "sourceDex": "orca",
+      "poolId": "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 746604,
+      "poolVolume24hUsd": 271162,
+      "feeBps": 1,
+      "tickSpacing": 1,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
+      "symbol": "EURC",
+      "decimals": 6
+    },
+    {
+      "baseMint": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+      "sourceDex": "raydium",
+      "poolId": "HBS7a3br8GMMWuqVa7VB3SMFa7xVi1tSFdoF5w4ZZ3kS",
+      "poolType": "cpmm",
+      "poolLiquidityUsd": 593120,
+      "poolVolume24hUsd": 76100,
+      "feeBps": 25,
+      "tickSpacing": null,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "SIMPLE_AMM"
+      ],
+      "isDirectUsdcPool": true,
       "mint": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
       "symbol": "POPCAT",
       "decimals": 9
     },
     {
+      "baseMint": "3KzAE8dPyJRgZ36Eh81v7WPwi6dm7bDhdMb8EAus2RAf",
+      "sourceDex": "orca",
+      "poolId": "FBBryPMjKvCAu8UEJNGhciYPTRGzd4dHsmiegFZ66PSP",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 414918,
+      "poolVolume24hUsd": 109137,
+      "feeBps": 16,
+      "tickSpacing": 16,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "3KzAE8dPyJRgZ36Eh81v7WPwi6dm7bDhdMb8EAus2RAf",
+      "symbol": "GOMINING",
+      "decimals": 9
+    },
+    {
+      "baseMint": "9gP2kCy3wA1ctvYWQk75guqXuHfrEomqydHLtcTCqiLa",
+      "sourceDex": "orca",
+      "poolId": "4gnf3XVk8A3vxFnnPtVqSFZa1SEPeXogvcetpZm6Q3pS",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 225419,
+      "poolVolume24hUsd": 145005,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "9gP2kCy3wA1ctvYWQk75guqXuHfrEomqydHLtcTCqiLa",
+      "symbol": "BNB",
+      "decimals": 8
+    },
+    {
+      "baseMint": "DvjbEsdca43oQcw2h3HW1CT7N3x5vRcr3QrvTUHnXvgV",
+      "sourceDex": "raydium",
+      "poolId": "5KXE8RMF7iW9Ptn665AHfzsMFjYb4LV2Ta8eZEtsTwWC",
+      "poolType": "cpmm",
+      "poolLiquidityUsd": 691686,
+      "poolVolume24hUsd": 40341,
+      "feeBps": 25,
+      "tickSpacing": null,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "SIMPLE_AMM"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "DvjbEsdca43oQcw2h3HW1CT7N3x5vRcr3QrvTUHnXvgV",
+      "symbol": "DOOD",
+      "decimals": 9
+    },
+    {
+      "baseMint": "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
+      "sourceDex": "orca",
+      "poolId": "HAWNPF6UZ8YgWisd2gsECNSchdn3hQTEujsZtGxKM1MW",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 251504,
+      "poolVolume24hUsd": 100186,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
       "mint": "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
       "symbol": "RENDER",
       "decimals": 8
     },
     {
+      "baseMint": "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",
+      "sourceDex": "orca",
+      "poolId": "HD8i7qr1hd9ida6sN71RbkLxbWcbvZS4NA5CY6vfcDpj",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 117916,
+      "poolVolume24hUsd": 149001,
+      "feeBps": 5,
+      "tickSpacing": 8,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",
+      "symbol": "JLP",
+      "decimals": 6
+    },
+    {
+      "baseMint": "Hg8bKz4mvs8KNj9zew1cEF9tDw1x2GViB4RFZjVEmfrD",
+      "sourceDex": "orca",
+      "poolId": "6KGwZbL2v9j4k7McfVaSaMgnZjv7KVcR3u8FmAW4HA68",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 227075,
+      "poolVolume24hUsd": 78915,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "Hg8bKz4mvs8KNj9zew1cEF9tDw1x2GViB4RFZjVEmfrD",
+      "symbol": "TDCCP",
+      "decimals": 9
+    },
+    {
+      "baseMint": "EchesyfXePKdLtoiZSL8pBe8Myagyy8ZRqsACNCFGnvp",
+      "sourceDex": "orca",
+      "poolId": "9N6C4WCxWKk9f7URFFTpZmBQSH78vEkpy1rCC9ZTGiD",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 224836,
+      "poolVolume24hUsd": 64224,
+      "feeBps": 1,
+      "tickSpacing": 1,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "EchesyfXePKdLtoiZSL8pBe8Myagyy8ZRqsACNCFGnvp",
+      "symbol": "FIDA",
+      "decimals": 6
+    },
+    {
+      "baseMint": "3dQTr7ror2QPKQ3GbBCokJUmjErGg8kTJzdnYjNfvi3Z",
+      "sourceDex": "orca",
+      "poolId": "Ab5pqdTEw1McsizEaQfLEyMLhkfxwzrpyqFASpftQcpq",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 109533,
+      "poolVolume24hUsd": 100289,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "3dQTr7ror2QPKQ3GbBCokJUmjErGg8kTJzdnYjNfvi3Z",
+      "symbol": "BORG",
+      "decimals": 9
+    },
+    {
+      "baseMint": "C4Kkr9NZU3VbyedcgutU6LKmi6MKz81sx6gRmk5pX519",
+      "sourceDex": "orca",
+      "poolId": "25q3qfHDpRq53HjPsxYEqnLg47rbMH5JiwTRY8HX9mP9",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 251613,
+      "poolVolume24hUsd": 38487,
+      "feeBps": 5,
+      "tickSpacing": 8,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "C4Kkr9NZU3VbyedcgutU6LKmi6MKz81sx6gRmk5pX519",
+      "symbol": "VEUR",
+      "decimals": 9
+    },
+    {
+      "baseMint": "7i5KKsX2weiTkry7jA4ZwSuXGhs5eJBEjY8vVxR4pfRx",
+      "sourceDex": "orca",
+      "poolId": "7PNQ9rfSGCbCC3XTeL6CwwAzevqQGvKXeXMxP2TjS7rM",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 66325,
+      "poolVolume24hUsd": 91719,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "7i5KKsX2weiTkry7jA4ZwSuXGhs5eJBEjY8vVxR4pfRx",
+      "symbol": "",
+      "decimals": 9
+    },
+    {
+      "baseMint": "4LLbsb5ReP3yEtYzmXewyGjcir5uXtKFURtaEUVC2AHs",
+      "sourceDex": "orca",
+      "poolId": "7AhWSjMiXtxgZ6tB39V65sF3Rguv6arkbLWyk2v9MxRV",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 67159,
+      "poolVolume24hUsd": 82507,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "4LLbsb5ReP3yEtYzmXewyGjcir5uXtKFURtaEUVC2AHs",
+      "symbol": "PRCL",
+      "decimals": 6
+    },
+    {
+      "baseMint": "AhhdRu5YZdjVkKR3wbnUDaymVQL2ucjMQ63sZ3LFHsch",
+      "sourceDex": "orca",
+      "poolId": "CsPcrAP4gL2JGJxRBLvw4fTBkGdpRDqiSSCfJ8WcTiUk",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 210259,
+      "poolVolume24hUsd": 34007,
+      "feeBps": 5,
+      "tickSpacing": 8,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "AhhdRu5YZdjVkKR3wbnUDaymVQL2ucjMQ63sZ3LFHsch",
+      "symbol": "VCHF",
+      "decimals": 9
+    },
+    {
+      "baseMint": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+      "sourceDex": "orca",
+      "poolId": "5Z66YYYaTmmx1R4mATAGLSc8aV4Vfy5tNdJQzk1GP9RF",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 128104,
+      "poolVolume24hUsd": 31066,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+      "symbol": "ORCA",
+      "decimals": 6
+    },
+    {
+      "baseMint": "HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC",
+      "sourceDex": "orca",
+      "poolId": "AogLVpRGYideoiLpTAuuQTuALjXLi2xZFNxQ2vqrKTJR",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 117874,
+      "poolVolume24hUsd": 25424,
+      "feeBps": 100,
+      "tickSpacing": 128,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC",
+      "symbol": "AI16Z",
+      "decimals": 9
+    },
+    {
+      "baseMint": "CRTx1JouZhzSU6XytsE42UQraoGqiHgxabocVfARTy2s",
+      "sourceDex": "orca",
+      "poolId": "2DY2irTz5JP1EhiGbjtZM6GDUGkUHQsx5f2MnQmBFfCg",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 65144,
+      "poolVolume24hUsd": 24774,
+      "feeBps": 1,
+      "tickSpacing": 1,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "CRTx1JouZhzSU6XytsE42UQraoGqiHgxabocVfARTy2s",
+      "symbol": "",
+      "decimals": 9
+    },
+    {
+      "baseMint": "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux",
+      "sourceDex": "orca",
+      "poolId": "8JwS5zosnLFT84S1NebSp1HS6aeaxviXYS7jBh9PQ8vp",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 57188,
+      "poolVolume24hUsd": 26906,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
       "mint": "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux",
       "symbol": "HNT",
       "decimals": 8
     },
     {
-      "mint": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
-      "symbol": "JTO",
+      "baseMint": "METAewgxyPbgwsseH8T16a39CQ5VyVxZi9zXiDPY18m",
+      "sourceDex": "orca",
+      "poolId": "8nJ76wCnqDK7REWwforxhDmvaF8bw8TPrGUwW3UNEeGk",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 43890,
+      "poolVolume24hUsd": 20273,
+      "feeBps": 30,
+      "tickSpacing": 64,
+      "notes": [
+        "DIRECT_USDC_POOL"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "METAewgxyPbgwsseH8T16a39CQ5VyVxZi9zXiDPY18m",
+      "symbol": "MPLX",
+      "decimals": 6
+    },
+    {
+      "baseMint": "DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT",
+      "sourceDex": "orca",
+      "poolId": "BAHDfjtuecFKuGdxWH3grdveFkLuNNhZM1FfARzbNxPy",
+      "poolType": "whirlpool",
+      "poolLiquidityUsd": 25343,
+      "poolVolume24hUsd": 29089,
+      "feeBps": 2,
+      "tickSpacing": 2,
+      "notes": [
+        "DIRECT_USDC_POOL",
+        "HIGH_ACTIVITY",
+        "C1_RESCUE"
+      ],
+      "isDirectUsdcPool": true,
+      "mint": "DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT",
+      "symbol": "USDe",
       "decimals": 9
     }
   ]

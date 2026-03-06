@@ -117,6 +117,9 @@ export async function runExperimentDReady(opts: ExperimentDReadyOptions = {}): P
 
     console.log(`\n[EXPERIMENT_D_READY] ═══ Cycle ${cycle} başlıyor (${pairs.length} pair) ═══`);
 
+    // Per-cycle stats accumulators
+    const cycleRecords: ExperimentDReadyRecord[] = [];
+
     for (const pair of pairs) {
       if (!running) break;
 
@@ -130,13 +133,29 @@ export async function runExperimentDReady(opts: ExperimentDReadyOptions = {}): P
           slippageBps,
           doJitoPrep,
         });
+
+        // Attach poolMeta from v2 discovery if available
+        if (pair.poolMeta) {
+          record.poolMeta = {
+            sourceDex: pair.poolMeta.sourceDex,
+            poolType: pair.poolMeta.poolType,
+            poolId: pair.poolMeta.poolId,
+            feeBps: pair.poolMeta.feeBps,
+            liqUsd: pair.poolMeta.poolLiquidityUsd,
+            vol24hUsd: pair.poolMeta.poolVolume24hUsd,
+            isDirectUsdcPool: pair.poolMeta.isDirectUsdcPool,
+          };
+        }
+
         await appendRecord(record);
+        cycleRecords.push(record);
 
         const statusEmoji = record.status === "READY" ? "✓" : record.status === "REJECTED" ? "✗" : record.status === "NO_OPP" ? "○" : "⚠";
         console.log(
           `[EXPERIMENT_D_READY] ${statusEmoji} ${pair.baseSymbol ?? pair.baseMint.slice(0, 8)}/USDC → ` +
           `status=${record.status} | profit=${record.opportunity.expectedNetProfitUsdc.toFixed(4)} | ` +
-          `D2S=${record.latencyMetrics.detectToSendLatencyMs}ms`
+          `D2S=${record.latencyMetrics.detectToSendLatencyMs}ms | ` +
+          `routes=${record.marketClassification.routeMarkets}`
         );
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
@@ -144,6 +163,7 @@ export async function runExperimentDReady(opts: ExperimentDReadyOptions = {}): P
         // Write ERROR record
         const errRecord = buildErrorRecord(pair, reason, notionalUsdc, minNetProfit);
         await appendRecord(errRecord);
+        cycleRecords.push(errRecord);
       }
 
       // Rate-limit delay between pairs
@@ -151,6 +171,9 @@ export async function runExperimentDReady(opts: ExperimentDReadyOptions = {}): P
         await new Promise((r) => setTimeout(r, pairDelayMs));
       }
     }
+
+    // ── Cycle Summary (v2.1) ──
+    printCycleSummary(cycle, cycleRecords);
 
     console.log(`[EXPERIMENT_D_READY] ═══ Cycle ${cycle} tamamlandı ═══`);
 
@@ -162,6 +185,94 @@ export async function runExperimentDReady(opts: ExperimentDReadyOptions = {}): P
   }
 
   console.log(`[EXPERIMENT_D_READY] Scanner durduruldu. Toplam cycle: ${cycle}`);
+}
+
+// ── Cycle Summary (v2.1) ──
+
+function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
+}
+
+function printCycleSummary(cycle: number, records: ExperimentDReadyRecord[]): void {
+  if (records.length === 0) return;
+
+  // Status distribution
+  const statusCounts: Record<string, number> = {};
+  for (const r of records) {
+    statusCounts[r.status] = (statusCounts[r.status] ?? 0) + 1;
+  }
+
+  // RouteMarkets histogram (from non-ERROR records that have classification)
+  const routeMarketsHist: Record<number, number> = {};
+  const routeMarketsValues: number[] = [];
+  let complexRouteCount = 0;
+
+  for (const r of records) {
+    if (r.status === "ERROR") continue;
+    const rm = r.marketClassification.routeMarkets;
+    if (rm > 0) {
+      routeMarketsHist[rm] = (routeMarketsHist[rm] ?? 0) + 1;
+      routeMarketsValues.push(rm);
+    }
+    if (r.marketClassification.complexRoute) complexRouteCount++;
+  }
+
+  routeMarketsValues.sort((a, b) => a - b);
+  const totalWithRoute = routeMarketsValues.length;
+  const routeLe3 = routeMarketsValues.filter((v) => v <= 3).length;
+  const routeGe5 = routeMarketsValues.filter((v) => v >= 5).length;
+  const pctLe3 = totalWithRoute > 0 ? ((routeLe3 / totalWithRoute) * 100).toFixed(1) : "0.0";
+  const pctGe5 = totalWithRoute > 0 ? ((routeGe5 / totalWithRoute) * 100).toFixed(1) : "0.0";
+  const p95Route = percentile(routeMarketsValues, 95);
+
+  // D2S (detect-to-send) latency stats
+  const d2sValues: number[] = [];
+  for (const r of records) {
+    const d2s = r.latencyMetrics.detectToSendLatencyMs;
+    if (d2s > 0) d2sValues.push(d2s);
+  }
+  d2sValues.sort((a, b) => a - b);
+  const avgD2S = d2sValues.length > 0 ? Math.round(d2sValues.reduce((s, v) => s + v, 0) / d2sValues.length) : 0;
+  const p95D2S = percentile(d2sValues, 95);
+
+  // Eligibility count
+  const eligibleCount = records.filter((r) => r.marketClassification.eligible).length;
+  const softlistCount = records.filter((r) => r.status === "NO_OPP" || r.status === "READY").length;
+
+  // Pool type distribution (v2 records with poolMeta)
+  const poolTypeCounts: Record<string, number> = {};
+  for (const r of records) {
+    const pt = r.poolMeta?.poolType ?? "unknown";
+    poolTypeCounts[pt] = (poolTypeCounts[pt] ?? 0) + 1;
+  }
+
+  console.log(`\n─── Cycle ${cycle} Summary ────────────────────────────────────`);
+  console.log(`  Total records:    ${records.length}`);
+  console.log(`  Status:           ${Object.entries(statusCounts).map(([k, v]) => `${k}=${v}`).join("  ")}`);
+  console.log(`  Eligible:         ${eligibleCount}/${records.length}`);
+  console.log(`  Softlist (NO_OPP+READY): ${softlistCount}`);
+
+  console.log(`\n  RouteMarkets Histogram:`);
+  for (const rm of Object.keys(routeMarketsHist).map(Number).sort((a, b) => a - b)) {
+    const count = routeMarketsHist[rm];
+    const bar = "█".repeat(Math.min(count, 40));
+    console.log(`    routes=${rm}: ${String(count).padStart(4)} ${bar}`);
+  }
+  console.log(`  p95RouteMarkets:    ${p95Route}`);
+  console.log(`  pctRouteMarkets≤3:  ${pctLe3}% (${routeLe3}/${totalWithRoute})`);
+  console.log(`  pctRouteMarkets≥5:  ${pctGe5}% (${routeGe5}/${totalWithRoute})`);
+  console.log(`  complexRoute=true:  ${complexRouteCount}`);
+
+  console.log(`\n  D2S Latency:`);
+  console.log(`    avgD2S:  ${avgD2S}ms`);
+  console.log(`    p95D2S:  ${Math.round(p95D2S)}ms`);
+
+  if (Object.keys(poolTypeCounts).length > 1 || !poolTypeCounts["unknown"]) {
+    console.log(`\n  Pool Types: ${Object.entries(poolTypeCounts).map(([k, v]) => `${k}=${v}`).join("  ")}`);
+  }
+  console.log(`──────────────────────────────────────────────────────────\n`);
 }
 
 // ── Per-pair processing ──
@@ -200,24 +311,8 @@ async function processPair(
   }
   const classMs = Math.round(performance.now() - classStart);
 
-  // If market filter rejects → REJECTED
-  if (!mc.eligible) {
-    return buildRecord(pair, "REJECTED", mc, {
-      notionalUsdc: ctx.notionalUsdc,
-      direction: "BUY_BASE_SELL_QUOTE",
-      expectedNetProfitUsdc: 0,
-      minNetProfitUsdc: ctx.minNetProfit,
-      profitDriftUsdc: null,
-      simulatedOutAmountUsdc: null,
-    }, {
-      detectSlot, detectTimestamp, quoteReceivedTimestamp: 0,
-      quoteLatencyMs: classMs, buildLatencyMs: 0, simulationLatencyMs: 0,
-      detectToSendLatencyMs: Math.round(performance.now() - classStart),
-      quoteToSendLatencyMs: 0, executionMode: "JITO_PREP",
-    }, buildEmptyJitoPrep("DISABLED"));
-  }
-
   // ── Step 2: Jupiter round-trip quotes (USDC→BASE→USDC) ──
+  // Always fetch quotes (even for REJECTED) to populate opportunity data for research.
   const quoteStart = performance.now();
   const amountRaw = toRaw(ctx.notionalUsdc, pair.quoteDecimals);
   const cfg = loadConfig();
@@ -226,6 +321,7 @@ async function processPair(
   let leg2ExpectedOut: bigint;
   let leg1Route: any;
   let leg2Route: any;
+  let quoteFailed = false;
 
   try {
     // Leg 1: USDC → BASE
@@ -249,6 +345,23 @@ async function processPair(
     leg2Route = r2;
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
+    // If filter already rejected, return REJECTED with the quote error info
+    if (!mc.eligible) {
+      return buildRecord(pair, "REJECTED", mc, {
+        notionalUsdc: ctx.notionalUsdc,
+        direction: "BUY_BASE_SELL_QUOTE",
+        expectedNetProfitUsdc: 0,
+        minNetProfitUsdc: ctx.minNetProfit,
+        profitDriftUsdc: null,
+        simulatedOutAmountUsdc: null,
+      }, {
+        detectSlot, detectTimestamp, quoteReceivedTimestamp: 0,
+        quoteLatencyMs: Math.round(performance.now() - quoteStart),
+        buildLatencyMs: 0, simulationLatencyMs: 0,
+        detectToSendLatencyMs: Math.round(performance.now() - classStart),
+        quoteToSendLatencyMs: 0, executionMode: "JITO_PREP",
+      }, buildEmptyJitoPrep("DISABLED"));
+    }
     return buildErrorRecord(pair, `quote_failed: ${reason}`, ctx.notionalUsdc, ctx.minNetProfit, mc);
   }
 
@@ -271,7 +384,29 @@ async function processPair(
   const feeUsdc = feeSol * ctx.solUsdcRate;
   const expectedNetProfitUsdc = grossProfitUsdc - feeUsdc;
 
-  // If eligible but profit < min → NO_OPP
+  // ── Step 3b: Determine status based on eligibility + profit ──
+  // REJECTED = market filter rejects (regardless of profit)
+  // NO_OPP   = eligible but profit < min
+  // READY    = eligible and profit >= min
+  if (!mc.eligible) {
+    // Filter rejected — record with full opportunity data from quotes
+    return buildRecord(pair, "REJECTED", mc, {
+      notionalUsdc: ctx.notionalUsdc,
+      direction: "BUY_BASE_SELL_QUOTE",
+      expectedNetProfitUsdc,
+      minNetProfitUsdc: ctx.minNetProfit,
+      profitDriftUsdc: null,
+      simulatedOutAmountUsdc: fromRaw(leg2ExpectedOut, pair.quoteDecimals),
+    }, {
+      detectSlot, detectTimestamp, quoteReceivedTimestamp,
+      quoteLatencyMs, buildLatencyMs: 0, simulationLatencyMs: 0,
+      detectToSendLatencyMs: Date.now() - detectTimestamp,
+      quoteToSendLatencyMs: Date.now() - quoteReceivedTimestamp,
+      executionMode: "JITO_PREP",
+    }, buildEmptyJitoPrep("DISABLED"));
+  }
+
+  // Eligible but profit below threshold → NO_OPP
   if (expectedNetProfitUsdc < ctx.minNetProfit) {
     return buildRecord(pair, "NO_OPP", mc, {
       notionalUsdc: ctx.notionalUsdc,
@@ -474,6 +609,7 @@ function buildRecord(
       ...mc,
       eligible: mc.eligible,
       rejectReasons: mc.rejectReasons,
+      complexRoute: mc.complexRoute ?? false,
     },
     opportunity,
     latencyMetrics: latency,

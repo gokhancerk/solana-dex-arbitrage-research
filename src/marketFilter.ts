@@ -27,16 +27,24 @@ const IMPACT_SAMPLE_1K = 1_000;
 const IMPACT_SAMPLE_3K = 3_000;
 const IMPACT_SAMPLE_5K = 5_000;
 
-/** Type C thresholds (strict) */
-const TYPE_C_IMPACT_3K_MIN = 0.2;   // % — below this = Type A
-const TYPE_C_IMPACT_3K_MAX = 1.0;   // % — above this = risky
-const TYPE_B_IMPACT_3K_THRESHOLD = 1.2; // % — above this = Type B (shallow)
+/** Type C thresholds */
+const TYPE_C_IMPACT_3K_MIN = 0.2;            // % — live lower bound (below = Type A)
+const TYPE_C_IMPACT_3K_MIN_RESEARCH = 0.05;  // % — research lower bound (captures shallow-route mid-liq)
+const TYPE_C_IMPACT_3K_MAX = 1.0;            // % — above this = risky
+const TYPE_B_IMPACT_3K_THRESHOLD = 1.2;      // % — above this = Type B (shallow)
 
-const MIN_VOLUME_24H = 50_000;       // USD
+/** Type C route-complexity caps — direct/shallow routes only */
+const TYPE_C_MAX_ROUTE_MARKETS = 2;          // live: Type C requires ≤2 hops
+const TYPE_C_MAX_ROUTE_MARKETS_RESEARCH = 4; // research: relaxed — allow 3-4 hop routes for discovery
+
+const MIN_VOLUME_24H = 50_000;       // USD (live)
+const MIN_VOLUME_24H_RESEARCH = 30_000; // USD (research — relaxed)
 const MIN_VOL_LIQ_RATIO = 0.05;
 const MAX_VOL_LIQ_RATIO = 1.0;
-const MAX_ROUTE_MARKETS = 3;
+const MAX_ROUTE_MARKETS = 3;         // live execution cap (general)
+const MAX_ROUTE_MARKETS_RESEARCH = 5; // research mode cap (general, EXPERIMENT_D_READY)
 const MAX_SLIPPAGE_CURVE_RATIO = 4;  // impact_5k / impact_1k — reject if > 4 (liquidity cliff)
+const MAX_SLIPPAGE_CURVE_RATIO_RESEARCH = 5; // research mode — loosened to reduce cliff rejections
 const TYPE_C_SLIPPAGE_CURVE_MAX = 3; // impact_5k / impact_1k for ideal Type C
 
 /** Type-based cache TTLs (ms) — volatile tokens refresh faster */
@@ -48,7 +56,8 @@ const CACHE_TTL_BY_TYPE: Record<string, number> = {
 };
 
 /** Minimum absolute liquidity to be eligible ($) */
-const MIN_LIQUIDITY = 100_000;
+const MIN_LIQUIDITY = 100_000;           // live
+const MIN_LIQUIDITY_RESEARCH = 80_000; // research — relaxed
 
 /** Birdeye API base URL */
 const BIRDEYE_BASE_URL = "https://public-api.birdeye.so";
@@ -61,6 +70,8 @@ interface CachedClassification {
 }
 
 const _classificationCache = new Map<string, CachedClassification>();
+
+// (Debug trace removed — root cause identified, kept histogram only)
 
 // ── Birdeye Data Fetcher ───────────────────────────────────────────
 
@@ -267,27 +278,22 @@ export async function classifyMarket(
     rejectReasons.push(`liquidity=$${liquidity.toFixed(0)} < $${MIN_LIQUIDITY} (insufficient depth)`);
   }
 
-  // ── Step 4: Classify ──
+  // ── Step 4: Classify (live mode — uses strict impact_3k_min=0.2%) ──
   let type: MarketType;
   let eligible = false;
 
   if (rejectReasons.length > 0) {
-    // Has hard reject — determine if A or B for diagnostics
-    if (impact3k < TYPE_C_IMPACT_3K_MIN) {
-      type = "A";
-    } else if (impact3k > TYPE_B_IMPACT_3K_THRESHOLD) {
-      type = "B";
-    } else {
-      type = "B"; // rejected but in mid-range → classify as B (failed other criteria)
-    }
+    if (impact3k < TYPE_C_IMPACT_3K_MIN) type = "A";
+    else if (impact3k > TYPE_B_IMPACT_3K_THRESHOLD) type = "B";
+    else type = "B";
   } else if (impact3k < TYPE_C_IMPACT_3K_MIN) {
-    // impact_3k < 0.2% → Type A (too competitive)
     type = "A";
     rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% < ${TYPE_C_IMPACT_3K_MIN}% (Type A — hyper competitive)`);
   } else if (impact3k >= TYPE_C_IMPACT_3K_MIN && impact3k <= TYPE_C_IMPACT_3K_MAX) {
-    // 0.2% ≤ impact_3k ≤ 1.0% — Type C sweet spot
-    // Additional check: slippage curve should be stable
-    if (slippageCurveRatio <= TYPE_C_SLIPPAGE_CURVE_MAX) {
+    if (routeMarkets > TYPE_C_MAX_ROUTE_MARKETS) {
+      type = "B";
+      rejectReasons.push(`ROUTE_TOO_DEEP_FOR_TYPE_C: routeMarkets=${routeMarkets} > ${TYPE_C_MAX_ROUTE_MARKETS} (live cap)`);
+    } else if (slippageCurveRatio <= TYPE_C_SLIPPAGE_CURVE_MAX) {
       type = "C";
       eligible = true;
     } else {
@@ -295,7 +301,6 @@ export async function classifyMarket(
       rejectReasons.push(`slippage_curve=${slippageCurveRatio.toFixed(2)} > ${TYPE_C_SLIPPAGE_CURVE_MAX} (unstable curve for Type C)`);
     }
   } else {
-    // impact_3k > 1.0% but ≤ 1.2% — borderline, still rejected
     type = "B";
     rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% > ${TYPE_C_IMPACT_3K_MAX}% (above Type C sweet spot)`);
   }
@@ -495,24 +500,46 @@ export async function classifyMarketByMint(
   const slippageCurveRatio = impact1k > 0 ? impact5k / impact1k : 0;
 
   // ── Step 3: Hard reject rules ──
+  // Research mode uses relaxed routeMarkets cap (4) with complexRoute tag;
+  // live execution still enforces MAX_ROUTE_MARKETS (3).
+  const isResearchMode = process.env.MODE === "EXPERIMENT_D_READY";
+  const effectiveRouteMax = isResearchMode ? MAX_ROUTE_MARKETS_RESEARCH : MAX_ROUTE_MARKETS;
+  const effectiveCurveMax = isResearchMode ? MAX_SLIPPAGE_CURVE_RATIO_RESEARCH : MAX_SLIPPAGE_CURVE_RATIO;
+  const effectiveMinVolume = isResearchMode ? MIN_VOLUME_24H_RESEARCH : MIN_VOLUME_24H;
+  const effectiveMinLiquidity = isResearchMode ? MIN_LIQUIDITY_RESEARCH : MIN_LIQUIDITY;
+  let complexRoute = false;
+
   if (impact3k > TYPE_B_IMPACT_3K_THRESHOLD) rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% > ${TYPE_B_IMPACT_3K_THRESHOLD}% (shallow liquidity)`);
   if (volumeLiquidityRatio < MIN_VOL_LIQ_RATIO) rejectReasons.push(`vol/liq=${volumeLiquidityRatio.toFixed(4)} < ${MIN_VOL_LIQ_RATIO}`);
-  if (routeMarkets > MAX_ROUTE_MARKETS) rejectReasons.push(`routeMarkets=${routeMarkets} > ${MAX_ROUTE_MARKETS}`);
-  if (volume24h < MIN_VOLUME_24H) rejectReasons.push(`volume24h=$${volume24h.toFixed(0)} < $${MIN_VOLUME_24H}`);
-  if (impact1k > 0 && slippageCurveRatio > MAX_SLIPPAGE_CURVE_RATIO) rejectReasons.push(`slippage_curve=${slippageCurveRatio.toFixed(2)} > ${MAX_SLIPPAGE_CURVE_RATIO} (liquidity cliff)`);
-  if (liquidity < MIN_LIQUIDITY) rejectReasons.push(`liquidity=$${liquidity.toFixed(0)} < $${MIN_LIQUIDITY} (insufficient depth)`);
+  if (routeMarkets > effectiveRouteMax) {
+    rejectReasons.push(`routeMarkets=${routeMarkets} > ${effectiveRouteMax}`);
+  } else if (routeMarkets > MAX_ROUTE_MARKETS) {
+    // 4-5 routes: research-eligible but tagged as complex
+    complexRoute = true;
+  }
+  if (volume24h < effectiveMinVolume) rejectReasons.push(`volume24h=$${volume24h.toFixed(0)} < $${effectiveMinVolume}`);
+  if (impact1k > 0 && slippageCurveRatio > effectiveCurveMax) rejectReasons.push(`slippage_curve=${slippageCurveRatio.toFixed(2)} > ${effectiveCurveMax} (liquidity cliff)`);
+  if (liquidity < effectiveMinLiquidity) rejectReasons.push(`liquidity=$${liquidity.toFixed(0)} < $${effectiveMinLiquidity} (insufficient depth)`);
 
-  // ── Step 4: Classify ──
+  // Effective Type C thresholds depend on mode
+  const effectiveTypeCImpactMin = isResearchMode ? TYPE_C_IMPACT_3K_MIN_RESEARCH : TYPE_C_IMPACT_3K_MIN;
+  const effectiveTypeCRouteMax = isResearchMode ? TYPE_C_MAX_ROUTE_MARKETS_RESEARCH : TYPE_C_MAX_ROUTE_MARKETS;
+
+  // ── Step 4: Classify (research uses effectiveTypeCImpactMin=0.05%) ──
   let type: MarketType;
   let eligible = false;
 
   if (rejectReasons.length > 0) {
-    type = impact3k < TYPE_C_IMPACT_3K_MIN ? "A" : "B";
-  } else if (impact3k < TYPE_C_IMPACT_3K_MIN) {
+    type = impact3k < effectiveTypeCImpactMin ? "A" : "B";
+  } else if (impact3k < effectiveTypeCImpactMin) {
     type = "A";
-    rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% < ${TYPE_C_IMPACT_3K_MIN}% (Type A — hyper competitive)`);
-  } else if (impact3k >= TYPE_C_IMPACT_3K_MIN && impact3k <= TYPE_C_IMPACT_3K_MAX) {
-    if (slippageCurveRatio <= TYPE_C_SLIPPAGE_CURVE_MAX) {
+    rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% < ${effectiveTypeCImpactMin}% (Type A — hyper competitive)`);
+  } else if (impact3k >= effectiveTypeCImpactMin && impact3k <= TYPE_C_IMPACT_3K_MAX) {
+    // Impact in Type C range — now check route complexity
+    if (routeMarkets > effectiveTypeCRouteMax) {
+      type = "B";
+      rejectReasons.push(`ROUTE_TOO_DEEP_FOR_TYPE_C: routeMarkets=${routeMarkets} > ${effectiveTypeCRouteMax}`);
+    } else if (slippageCurveRatio <= TYPE_C_SLIPPAGE_CURVE_MAX) {
       type = "C";
       eligible = true;
     } else {
@@ -524,17 +551,16 @@ export async function classifyMarketByMint(
     rejectReasons.push(`impact_3k=${impact3k.toFixed(4)}% > ${TYPE_C_IMPACT_3K_MAX}% (above Type C sweet spot)`);
   }
 
-  const classification = buildResult(type, { impact1k, impact3k, impact5k, routeMarkets, volume24h, liquidity, volumeLiquidityRatio, slippageCurveRatio, rejectReasons, eligible });
+  const classification = buildResult(type, { impact1k, impact3k, impact5k, routeMarkets, volume24h, liquidity, volumeLiquidityRatio, slippageCurveRatio, rejectReasons, eligible, complexRoute });
 
   // ── Cache ──
   _classificationCache.set(cacheKey, { classification, fetchedAt: Date.now() });
 
   const emoji = eligible ? "✓" : "✗";
   console.log(
-    `[MARKET-FILTER] ${tag} → Type ${type} ${emoji} | ` +
+    `[MARKET-FILTER] ${tag} → Type ${type} ${emoji}${complexRoute ? " [complexRoute]" : ""} | ` +
       `impact: 1k=${impact1k.toFixed(4)}% 3k=${impact3k.toFixed(4)}% 5k=${impact5k.toFixed(4)}% | ` +
-      `routes=${routeMarkets} | vol=$${volume24h.toLocaleString()} | liq=$${liquidity.toLocaleString()} | ` +
-      `v/l=${volumeLiquidityRatio.toFixed(4)} | curve=${slippageCurveRatio.toFixed(2)}` +
+      `routes=${routeMarkets} | v/l=${volumeLiquidityRatio.toFixed(4)} | curve=${slippageCurveRatio.toFixed(2)}` +
       (rejectReasons.length > 0 ? ` | reject: [${rejectReasons.join("; ")}]` : "")
   );
 

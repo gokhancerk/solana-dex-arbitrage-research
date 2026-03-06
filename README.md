@@ -1,51 +1,126 @@
-# Solana ↔ OKX DEX Arbitrage (Backend-Only)
+# Solana Arbitrage Bot (Backend-Only)
 
-TypeScript (Node 18) scaffolding for JUP/USDT arbitrage across Jupiter and OKX DEX on Solana mainnet-beta. Safety defaults: 0.2% slippage cap, ≤200 USDT notional, full simulation before send, retries with exponential backoff, and circuit breaker after three failed sends.
+TypeScript (Node 20+) ile Solana mainnet-beta üzerinde çalışan çok katmanlı arbitraj botu. İki bağımsız arbitraj katmanı barındırır. Güvenlik varsayılanları: ≤0.1% slippage cap, yapılandırılabilir notional cap, tam simülasyon, exponential backoff retry ve circuit breaker.
+
+---
+
+## İki Arbitraj Katmanı
+
+Sistemde birbirinden bağımsız çalışabilen **iki farklı arbitraj katmanı** mevcuttur:
+
+### Katman 0 — Aggregator Arbitrage (Jupiter ↔ OKX DEX)
+
+İki farklı DEX aggregator'ı (Jupiter Aggregator ve OKX DEX Aggregator) arasındaki fiyat farklarını kullanır.
+
+| Özellik | Detay |
+|---|---|
+| **Venue'ler** | Jupiter Aggregator API v6 ↔ OKX DEX Aggregator API v6 |
+| **Token çiftleri** | SOL/USDC, WIF/USDC, JUP/USDC, BONK/USDC, WEN/USDC, PYTH/USDC |
+| **Yönler** | `JUP_TO_OKX` (Jup'tan al, OKX'te sat) / `OKX_TO_JUP` (OKX'ten al, Jup'ta sat) |
+| **Execution** | Jito Bundle (atomik, 2-leg aynı blokta) veya Sequential (Leg1→confirm→buildFreshLeg2→Leg2) |
+| **Tetikleme** | Slot-tabanlı event-driven (Helius WebSocket → PriceTicker), round-robin multi-token |
+| **Notional** | Yapılandırılabilir ($1–$1000 USDC aralığı) |
+| **Durum** | **Live — aktif çalışıyor** (dry-run/live modlar ile) |
+
+**Akış:**
+```
+USDC → <token> (Venue A) → <token> → USDC (Venue B) → Net kâr = fark − fee
+```
+
+### Katman 1 — Cross-DEX Pool Arbitrage (Orca Whirlpool ↔ Raydium CPMM)
+
+Aynı token/USDC çifti için Orca Whirlpool (CLMM) ve Raydium CPMM havuzları arasındaki doğrudan fiyat farkını kullanır. Model/TVL tahmini yerine **gerçek quote çıktılarına** dayanır.
+
+| Özellik | Detay |
+|---|---|
+| **Venue'ler** | Orca Whirlpools (CLMM, Jupiter `dexes=Whirlpool` kısıtlı) ↔ Raydium CPMM (on-chain reserve + constant-product) |
+| **Token çiftleri** | Orca+Raydium'da eşleşen tüm USDC havuzları (~20 çift whitelist) |
+| **Yönler** | `O_TO_R` (Orca'dan al, Raydium'da sat) / `R_TO_O` (Raydium'dan al, Orca'da sat) |
+| **Notional bantları** | Micro: $30–$100 / Scale: $1k–$3k |
+| **Tetikleme** | Quote-only watch döngüsü (1s poll, yapılandırılabilir süre) |
+| **Durum** | **Research/Observation** — M3 quote-only watch + event detection aktif, execution henüz bağlanmadı |
+
+**Pipeline:**
+```
+1. Pool Discovery (discoverOrcaPools + discoverRaydiumCpmmPools)
+2. Pool Matching (matchRoute1Pools — baseMint eşleştirme)
+3. Arb Scoring (scoreRoute1Arb — deterministic edge hesaplama)
+4. Live Watch (arbWatch — gerçek zamanlı quote izleme + event detection)
+5. [Bekliyor] Execution bağlantısı (Katman 0 altyapısı kullanılacak)
+```
+
+### Katman Karşılaştırması
+
+| | Katman 0 (Aggregator) | Katman 1 (Cross-DEX Pool) |
+|---|---|---|
+| Veri kaynağı | Aggregator REST API quote | Gerçek on-chain reserve / DEX-native quote |
+| Execution risk | MEV, arada fiyat kayması | Aynı + havuz likiditesi yetersizliği |
+| Atomik execution | Jito bundle destekli | Henüz yok (planlanan) |
+| Latency profili | ~600ms (API cooldown dahil) | ~1s (poll-based, optimize edilebilir) |
+| Canlı trade | ✅ Evet | ❌ Henüz değil — observation modunda |
+
+---
+
+## Yol Haritası: Live Micro
+
+
+Planlanan geçiş:
+1. **Micro validation:** Katman 1'de $30–$100 bandında düşük riskli canlı trade'ler, winrate ve net PnL metriklerinin toplanması
+2. **Execution entegrasyonu:** Katman 0'ın Jito/sequential altyapısının Katman 1'e bağlanması
+3. **Scale-up:** Katman 1 scale bandına ($1k–$3k) geçiş, yeni DEX/havuz entegrasyonları
+
+Micro pass'in başarı kriterleri: pozitif winrate (>%55), tutarlı net kâr, kabul edilebilir slippage drift (<5 bps).
+
+---
 
 ## Setup
 
 1. Install deps: `npm install`
 2. Create `.env` with required values (examples):
    ```env
-  HELIUS_API_KEY=your_helius_key
-  SOLANA_RPC_PRIMARY=https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
-  SOLANA_RPC_BACKUP=https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
-  SOLANA_WS_PRIMARY=wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
-  SOLANA_WS_BACKUP=wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
+   HELIUS_API_KEY=your_helius_key
+   SOLANA_RPC_PRIMARY=https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
+   SOLANA_RPC_BACKUP=https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
+   SOLANA_WS_PRIMARY=wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
+   SOLANA_WS_BACKUP=wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
    SOLANA_COMMITMENT=confirmed
    PRIORITY_FEE_MICROLAMPORTS=10000
-   USDT_MINT=Es9vMFrzaCERWf9qgX9NybmMtXJgpNNLeebv12qVDZr
-   USDT_DECIMALS=6
-   JUP_MINT=<official JUP mint>
-   JUP_DECIMALS=6
+   USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
    OKX_BASE_URL=https://www.okx.com
    OKX_API_KEY=...
    OKX_API_SECRET=...
    OKX_API_PASSPHRASE=...
    OKX_API_PROJECT=...
-  WALLET_KEYPATH=/absolute/path/to/your/encrypted-keypair.json
-  # Net profit gate (USDC). Trades with net profit below this are skipped.
-  MIN_NET_PROFIT_USDC=0.05
-  # Estimated SOL/USDC rate for fee conversion (safe fallback)
-  SOL_USDC_RATE=150
-  # Optional: dry-run helpers
-  DIRECTION=JUP_TO_OKX
-  NOTIONAL_USD=50
+   WALLET_KEYPATH=/absolute/path/to/your/encrypted-keypair.json
+   MIN_NET_PROFIT_USDC=0.12
+   SOL_USDC_RATE=150
+   SCAN_TOKENS=SOL,WIF,JUP
+   DRY_RUN=true
    ```
 
 ## Key Modules
 
+### Katman 0 (Aggregator Arb)
 - [src/config.ts](src/config.ts): env-driven config (RPCs, slippage, limits, OKX creds, token mints/decimals).
 - [src/jupiter.ts](src/jupiter.ts): Jupiter quotes + swap transaction builder with ALT support and simulation helper.
 - [src/okxDex.ts](src/okxDex.ts): OKX DEX quotes + swap transaction builder (uses Wallet/Dex API advanced control) with simulation helper.
 - [src/execution.ts](src/execution.ts): orchestrates `buildAndSimulate` for both directions and `sendWithRetry` with backoff + circuit breaker.
+- [src/jito.ts](src/jito.ts): Jito Block Engine integration — atomic 2-leg bundles, tip yönetimi, rate-limit cooldown.
 - [src/telemetry.ts](src/telemetry.ts): produce structured telemetry objects for downstream analytics.
 - [src/wallet.ts](src/wallet.ts): load keypairs from `WALLET_KEYPATH` (JSON array preferred).
-- [src/fees.ts](src/fees.ts): fetch recent priority fee suggestion.
+- [src/fees.ts](src/fees.ts): fetch recent priority fee suggestion (dynamic median + cap).
 - [src/stream/slotDriver.ts](src/stream/slotDriver.ts): Helius WebSocket slot subscription for event-driven triggers.
-- [src/stream/priceTicker.ts](src/stream/priceTicker.ts): sample event-driven loop that builds+sims every N slots instead of polling.
+- [src/stream/priceTicker.ts](src/stream/priceTicker.ts): slot-based event-driven trade loop — round-robin multi-token, bi-directional parallel scan.
 
-## Usage
+### Katman 1 (Cross-DEX Pool Arb)
+- [src/scripts/discoverOrcaPools.ts](src/scripts/discoverOrcaPools.ts): Orca Whirlpool havuz keşfi ve skorlama.
+- [src/scripts/discoverRaydiumCpmmPools.ts](src/scripts/discoverRaydiumCpmmPools.ts): Raydium CPMM havuz keşfi.
+- [src/scripts/matchRoute1Pools.ts](src/scripts/matchRoute1Pools.ts): Orca+Raydium havuzlarını baseMint üzerinden eşleştirme.
+- [src/scripts/scoreRoute1Arb.ts](src/scripts/scoreRoute1Arb.ts): Deterministic arb edge hesaplama (micro/scale whitelist üretimi).
+- [src/scripts/arbWatch.ts](src/scripts/arbWatch.ts): M3 gerçek zamanlı quote-only watch — event detection, JSONL telemetri.
+- [src/scripts/m3Health.ts](src/scripts/m3Health.ts): M3 sağlık kontrolü (10-dakika health run).
+
+## Usage (Katman 0)
 
 ```ts
 import { buildAndSimulate, sendWithRetry } from "./src/execution.js";
@@ -85,21 +160,43 @@ This builds both legs for the chosen direction, simulates, and prints expected v
 
 Instead of polling quotes, hook into Solana slots via Helius WebSocket and trigger sims on a cadence:
 
-```
+```ts
 import { PriceTicker } from "./src/stream/priceTicker.js";
 
-// every 4 slots (~2s) run bi-directional quote scan (JUP↔OKX) and execute the best route
-new PriceTicker({ slotsPerCheck: 4 }).start();
+// every 2 slots (~0.8s) run bi-directional quote scan (JUP↔OKX) and execute the best route
+new PriceTicker({ slotsPerCheck: 2 }).start();
 ```
 Set `SOLANA_WS_PRIMARY` / `SOLANA_WS_BACKUP` (Helius URLs) in `.env`. The ticker automatically scans both JUP→OKX and OKX→JUP directions in parallel and picks the most profitable route.
+
+## Usage (Katman 1 — Observation Pipeline)
+
+```bash
+# 1. Havuz keşfi
+npx tsx src/scripts/discoverOrcaPools.ts
+npx tsx src/scripts/discoverRaydiumCpmmPools.ts
+
+# 2. Havuz eşleştirme
+npx tsx src/scripts/matchRoute1Pools.ts
+
+# 3. Deterministic scoring
+npm run score:arb
+
+# 4. Gerçek zamanlı quote izleme (60 dk varsayılan)
+npm run m3:watch
+npm run m3:watch:6h     # 6 saat
+npm run m3:watch:24h    # 24 saat
+```
+
+Output: `data/arb_watch_*.jsonl` (sample telemetri), `data/arb_events.jsonl` (event detection).
 
 ## Telemetry Shape
 
 ```ts
+// Katman 0 — Aggregator Arb
 {
-  pair: "JUP/USDT",
+  pair: "SOL/USDC",
   direction: "JUP_TO_OKX" | "OKX_TO_JUP",
-  simulatedAmountOut: string,        // raw units
+  simulatedAmountOut: string,
   realizedAmountOut?: string,
   effectiveSlippageBps?: number,
   success: boolean,
@@ -107,15 +204,42 @@ Set `SOLANA_WS_PRIMARY` / `SOLANA_WS_BACKUP` (Helius URLs) in `.env`. The ticker
   txSignatures: string[],
   timestamp: string,
   retries: number,
-  profitLabel: "profit" | "loss" | "flat"
+  profitLabel: "profit" | "loss" | "flat",
+  netProfitUsdc: number,
+  status: TelemetryStatus,
+  realizedPnl?: RealizedPnlInfo,
+  latencyMetrics?: LatencyMetrics,
+  jitoBundleTelemetry?: JitoBundleTelemetry
+}
+
+// Katman 1 — Cross-DEX Pool Watch
+{
+  ts: number,
+  tickId: number,
+  pairId: string,
+  baseMint: string,
+  baseSymbol: string,
+  notional: number,
+  direction: "O_TO_R" | "R_TO_O",
+  netProfitBps: number,
+  netProfitUsdc: number,
+  quoteOrca: { inUsdc: number, outTokenRaw: bigint },
+  quoteRaydium: { inTokenRaw: bigint, outUsdc: number }
 }
 ```
 
 ## Safety Checklist
 
-- Keep notional ≤200 USDT and slippage ≤0.2%.
-- Require all OKX creds before sending mainnet transactions.
+- Slippage cap ≤0.1% (10 bps) — aşıldığında trade iptal edilir.
+- Notional cap yapılandırılabilir (varsayılan 1000 USDC).
+- Net Profit Gate: brüt kâr − tahmini fee ≥ eşik × 1.5 buffer (live mod).
 - Simulate every swap; abort on sim error or slippage breach.
-- Watch the circuit breaker (3 failed sends) before retrying.
-- Prefer ALTs and set priority fees via `PRIORITY_FEE_MICROLAMPORTS`.
+- Circuit breaker: 3 ardışık başarısız gönderimde `SendError` fırlatılır.
+- Emergency Unwind: Leg2 başarısız → takılı token'ı USDC'ye çevir (5 retry).
+- Prefer ALTs and set priority fees via `DYNAMIC_PRIORITY_FEE=true` + `MAX_PRIORITY_FEE`.
+- Jito atomic bundles for MEV protection (optional, `USE_JITO_BUNDLE=true`).
 - Store wallet keys in an encrypted file referenced by `WALLET_KEYPATH`; avoid keeping raw keys in `.env`.
+
+## Sources
+
+[Understanding Slots, Blocks, and Epochs on Solana](https://www.helius.dev/blog/solana-slots-blocks-and-epochs)

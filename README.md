@@ -7,10 +7,10 @@ The system measures quote edges, validates opportunities via simulation,
 executes atomic arbitrage transactions, and analyzes execution outcomes
 under real network conditions.
 
-Final Result
+### Final Result
 
-Execution engine: SUCCESS
-Trading thesis: FAILED (route saturation due to MEV competition)
+- Execution engine: SUCCESS
+- Trading thesis: FAILED (route saturation due to MEV competition)
                      
                      
                      ┌──────────────────────────┐

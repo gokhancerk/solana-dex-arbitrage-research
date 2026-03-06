@@ -1,3 +1,66 @@
+                     ┌──────────────────────────┐
+                     │      Market Data         │
+                     │  Solana DEX Pools        │
+                     │  (Orca / Raydium)        │
+                     └─────────────┬────────────┘
+                                   │
+                                   ▼
+                     ┌──────────────────────────┐
+                     │   Quote Measurement      │
+                     │                          │
+                     │  • Quote sampling        │
+                     │  • Edge detection        │
+                     │  • Session analysis      │
+                     │  • Event logging         │
+                     └─────────────┬────────────┘
+                                   │
+                                   ▼
+                     ┌──────────────────────────┐
+                     │   Opportunity Filter     │
+                     │                          │
+                     │  • Threshold checks      │
+                     │  • Edge validation       │
+                     │  • Trigger decision      │
+                     └─────────────┬────────────┘
+                                   │
+                                   ▼
+                     ┌──────────────────────────┐
+                     │  Simulation Layer        │
+                     │                          │
+                     │  • simulateTransaction   │
+                     │  • Slippage estimation   │
+                     │  • Feasibility check     │
+                     └─────────────┬────────────┘
+                                   │
+                                   ▼
+                     ┌──────────────────────────┐
+                     │  Atomic Execution Engine │
+                     │                          │
+                     │  VersionedTransaction    │
+                     │  ├─ Orca swap            │
+                     │  └─ Raydium swap         │
+                     │                          │
+                     │  Single TX atomic arb    │
+                     └─────────────┬────────────┘
+                                   │
+                                   ▼
+                     ┌──────────────────────────┐
+                     │   Transaction Submit     │
+                     │                          │
+                     │  Helius RPC              │
+                     │  sendSmartTransaction    │
+                     └─────────────┬────────────┘
+                                   │
+                                   ▼
+                     ┌──────────────────────────┐
+                     │   Execution Analysis     │
+                     │                          │
+                     │  • Latency measurement   │
+                     │  • Realized PnL          │
+                     │  • MEV competition       │
+                     │  • Postmortem analysis   │
+                     └──────────────────────────┘
+
 # SOLANA ARBITRAGE PROJECT — FINAL VERDICT / POSTMORTEM
 
 ## 1. Nihai Karar

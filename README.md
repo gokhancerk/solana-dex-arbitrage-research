@@ -61,228 +61,6 @@
                      │  • Postmortem analysis   │
                      └──────────────────────────┘
 
-# SOLANA ARBITRAGE PROJECT — FINAL VERDICT / POSTMORTEM
-
-## 1. Nihai Karar
-
-VERDICT: HARD KILL (product thesis)
-STATUS: Research artifact kept, trading thesis closed
-
-Bu proje:
-- kârlı ve sürdürülebilir bir Solana DEX arbitrage ürünü olarak devam ETMEYECEK
-- araştırma / execution engineering çıktısı olarak arşivlenecek
-
----
-
-## 2. Neden Kapatıldı?
-
-Ana neden:
-- Sorun artık implementation değil
-- Sorun battlefield / market structure
-
-Net olarak doğrulananlar:
-- Quote measurement pipeline çalıştı
-- Edge detection çalıştı
-- Simulation çalıştı
-- Dust execution çalıştı
-- Atomic execution çalıştı
-- Helius landing çalıştı
-
-Buna rağmen:
-- realized PnL negatif kaldı
-- atomic single-TX execution bile route’u ekonomik olarak kurtarmadı
-
-Sonuç:
-- Route matematiksel olarak edge gösterse de
-- gerçek execution ortamında edge capture edilemedi
-- dolayısıyla ürün tezi başarısız oldu
-
----
-
-## 3. Kanıtlanan Teknik Bulgular
-
-### 3.1 Measurement
-- M3 quote-only pipeline başarıyla çalıştı
-- Edge event’leri tespit edildi
-- Session/workability ölçümü anlamlı veri üretti
-
-### 3.2 Simulation
-- Stage3 / sim katmanı çalıştı
-- Execution feasibility kağıt üzerinde pozitif sinyal verdi
-
-### 3.3 Real Execution
-- Sequential execution:
-  - stale quote problemi
-  - ekonomik olarak başarısız
-
-- Jito public bundle:
-  - landing zayıf / timeout / rate-limit
-  - public route doygunluğu işareti
-
-- Helius send path:
-  - landing stabil
-  - submit path doğrulandı
-
-- Atomic single-TX execution:
-  - inventory riski çözüldü
-  - execution modeli doğrulandı
-  - buna rağmen median realized negatif kaldı
-
-Kritik bulgu:
-- Atomic execution sonrası bile realized bps ≤ 0
-- Bu, sorunun artık “execution modeli eksikliği” değil
-  “route economics / competition saturation” olduğunu gösterir
-
----
-
-## 4. Fail Mekanizması
-
-Route:
-- Orca ↔ Raydium
-- özellikle mSOL / SOL benzeri obvious surface’ler
-
-Fail mekanizması:
-- quote-to-execution delay
-- MEV / searcher competition
-- execution slippage
-- public surface saturation
-
-Pratik sonuç:
-- quote edge görüldü
-- fakat edge execution sırasında alındı / eritildi
-- işlem zincire inse bile ekonomi negatif kaldı
-
-Özet:
-- problem code bug değil
-- problem route’un rekabet altında ekonomik olarak ölmesi
-
----
-
-## 5. Neden Devam Edilmedi?
-
-Devam edilmedi çünkü:
-
-1. Aynı route üzerinde temel teknik hipotezler test edildi
-- sequential
-- bundle
-- helius send path
-- atomic execution
-
-2. En güçlü execution modeli bile net pozitiflik üretmedi
-- “belki atomic kurtarır” hipotezi test edildi
-- kurtarmadı
-
-3. Yeni denemeler artık düşük kaldıraçlı olurdu
-- daha fazla aynı route test etmek
-- aynı problemi yeniden görmekten öte değer üretmezdi
-
-4. Kapital büyütmek çözüm değildir
-- execution negatifken notional artırmak sadece kaybı büyütür
-
-5. Private relay / paid infra bu aşamada garanti çözüm değildir
-- route ekonomisi zaten zayıfsa
-- daha iyi infra sadece daha hızlı negatif sonuç üretir
-
-6. New pool / sniper benzeri alanlar farklı ürün hipotezidir
-- bu route’un continuation’ı değildir
-- yeni proje / yeni hypothesis sayılır
-
-Sonuç:
-- mevcut tez yeterince test edildi
-- yeni efor aynı product thesis için rasyonel değil
-
----
-
-## 6. Neden “Soft Kill” Değil “Hard Kill”?
-
-Soft kill değil çünkü:
-- execution modeli artık yeterince ileri seviyede test edildi
-- atomic TX başarıyla çalıştı
-- landing tarafı çalıştı
-- buna rağmen ekonomi negatif kaldı
-
-Yani eksik kalan şey:
-- küçük bir bug
-- ufak bir infra düzeltmesi
-- threshold tuning
-
-değil.
-
-Eksik kalan şey:
-- bu route’ta gerçek ekonomik edge
-
-Bu yüzden:
-- route/product thesis için verdict = HARD KILL
-
-Not:
-- Framework / engine için kill yok
-- Sadece bu ticari tez için kill var
-
----
-
-## 7. Projeden Geriye Kalan Değer
-
-Bu proje başarısız bir ürün olabilir ama başarısız bir mühendislik çalışması değildir.
-
-Çıktılar:
-- deterministic quote measurement pipeline
-- session/workability framework
-- execution feasibility test katmanı
-- simulation modülü
-- dust execution modülü
-- atomic single-TX arb execution
-- landing / infra test disiplini
-- kill-switch ve staged validation yaklaşımı
-
-Bu nedenle proje:
-- trading product olarak kapandı
-- research / infra artifact olarak değerlidir
-
----
-
-## 8. Gelecekte Ne Ancak “Yeni Proje” Sayılır?
-
-Aşağıdakiler continuation değil, yeni hypothesis olur:
-- farklı surface
-- farklı DEX kombinasyonu
-- less-contested route
-- new pool discovery
-- different market microstructure
-- CLOB / DLMM / non-obvious route
-- private relay ile tamamen yeni edge testi
-
-Yani:
-- mevcut route kapandı
-- yeni denenecek her şey yeni araştırma başlığıdır
-
----
-
-## 9. Operasyonel Kapanış
-
-Yapılacaklar:
-- repo silinmez
-- archive korunur
-- final summary yazılır
-- çalışan modüller not edilir
-- fail nedeni açıkça belgelenir
-
-Arşiv etiketi:
-- route1_hard_kill
-- atomic_engine_pass_route_fail
-
----
-
-## 10. Tek Cümlelik Nihai Özet
-
-Bu proje,
-“Solana public obvious DEX arbitrage route’u retail-access infra ile kârlı şekilde capture edilebilir mi?”
-sorusunu test etti.
-
-Cevap:
-HAYIR.
-
-Sebep:
-Execution altyapısı sonunda çalışsa bile route ekonomisi rekabet altında negatif kaldı.
 
 
 
@@ -527,6 +305,239 @@ Output: `data/arb_watch_*.jsonl` (sample telemetri), `data/arb_events.jsonl` (ev
 - Prefer ALTs and set priority fees via `DYNAMIC_PRIORITY_FEE=true` + `MAX_PRIORITY_FEE`.
 - Jito atomic bundles for MEV protection (optional, `USE_JITO_BUNDLE=true`).
 - Store wallet keys in an encrypted file referenced by `WALLET_KEYPATH`; avoid keeping raw keys in `.env`.
+
+
+
+# SOLANA ARBITRAGE PROJECT — FINAL VERDICT / POSTMORTEM
+
+## 1. Nihai Karar
+
+VERDICT: HARD KILL (product thesis)
+STATUS: Research artifact kept, trading thesis closed
+
+Bu proje:
+- kârlı ve sürdürülebilir bir Solana DEX arbitrage ürünü olarak devam ETMEYECEK
+- araştırma / execution engineering çıktısı olarak arşivlenecek
+
+---
+
+## 2. Neden Kapatıldı?
+
+Ana neden:
+- Sorun artık implementation değil
+- Sorun battlefield / market structure
+
+Net olarak doğrulananlar:
+- Quote measurement pipeline çalıştı
+- Edge detection çalıştı
+- Simulation çalıştı
+- Dust execution çalıştı
+- Atomic execution çalıştı
+- Helius landing çalıştı
+
+Buna rağmen:
+- realized PnL negatif kaldı
+- atomic single-TX execution bile route’u ekonomik olarak kurtarmadı
+
+Sonuç:
+- Route matematiksel olarak edge gösterse de
+- gerçek execution ortamında edge capture edilemedi
+- dolayısıyla ürün tezi başarısız oldu
+
+---
+
+## 3. Kanıtlanan Teknik Bulgular
+
+### 3.1 Measurement
+- M3 quote-only pipeline başarıyla çalıştı
+- Edge event’leri tespit edildi
+- Session/workability ölçümü anlamlı veri üretti
+
+### 3.2 Simulation
+- Stage3 / sim katmanı çalıştı
+- Execution feasibility kağıt üzerinde pozitif sinyal verdi
+
+### 3.3 Real Execution
+- Sequential execution:
+  - stale quote problemi
+  - ekonomik olarak başarısız
+
+- Jito public bundle:
+  - landing zayıf / timeout / rate-limit
+  - public route doygunluğu işareti
+
+- Helius send path:
+  - landing stabil
+  - submit path doğrulandı
+
+- Atomic single-TX execution:
+  - inventory riski çözüldü
+  - execution modeli doğrulandı
+  - buna rağmen median realized negatif kaldı
+
+Kritik bulgu:
+- Atomic execution sonrası bile realized bps ≤ 0
+- Bu, sorunun artık “execution modeli eksikliği” değil
+  “route economics / competition saturation” olduğunu gösterir
+
+---
+
+## 4. Fail Mekanizması
+
+Route:
+- Orca ↔ Raydium
+- özellikle mSOL / SOL benzeri obvious surface’ler
+
+Fail mekanizması:
+- quote-to-execution delay
+- MEV / searcher competition
+- execution slippage
+- public surface saturation
+
+Pratik sonuç:
+- quote edge görüldü
+- fakat edge execution sırasında alındı / eritildi
+- işlem zincire inse bile ekonomi negatif kaldı
+
+Özet:
+- problem code bug değil
+- problem route’un rekabet altında ekonomik olarak ölmesi
+
+---
+
+## 5. Neden Devam Edilmedi?
+
+Devam edilmedi çünkü:
+
+1. Aynı route üzerinde temel teknik hipotezler test edildi
+- sequential
+- bundle
+- helius send path
+- atomic execution
+
+2. En güçlü execution modeli bile net pozitiflik üretmedi
+- “belki atomic kurtarır” hipotezi test edildi
+- kurtarmadı
+
+3. Yeni denemeler artık düşük kaldıraçlı olurdu
+- daha fazla aynı route test etmek
+- aynı problemi yeniden görmekten öte değer üretmezdi
+
+4. Kapital büyütmek çözüm değildir
+- execution negatifken notional artırmak sadece kaybı büyütür
+
+5. Private relay / paid infra bu aşamada garanti çözüm değildir
+- route ekonomisi zaten zayıfsa
+- daha iyi infra sadece daha hızlı negatif sonuç üretir
+
+6. New pool / sniper benzeri alanlar farklı ürün hipotezidir
+- bu route’un continuation’ı değildir
+- yeni proje / yeni hypothesis sayılır
+
+Sonuç:
+- mevcut tez yeterince test edildi
+- yeni efor aynı product thesis için rasyonel değil
+
+---
+
+## 6. Neden “Soft Kill” Değil “Hard Kill”?
+
+Soft kill değil çünkü:
+- execution modeli artık yeterince ileri seviyede test edildi
+- atomic TX başarıyla çalıştı
+- landing tarafı çalıştı
+- buna rağmen ekonomi negatif kaldı
+
+Yani eksik kalan şey:
+- küçük bir bug
+- ufak bir infra düzeltmesi
+- threshold tuning
+
+değil.
+
+Eksik kalan şey:
+- bu route’ta gerçek ekonomik edge
+
+Bu yüzden:
+- route/product thesis için verdict = HARD KILL
+
+Not:
+- Framework / engine için kill yok
+- Sadece bu ticari tez için kill var
+
+---
+
+## 7. Projeden Geriye Kalan Değer
+
+Bu proje başarısız bir ürün olabilir ama başarısız bir mühendislik çalışması değildir.
+
+Çıktılar:
+- deterministic quote measurement pipeline
+- session/workability framework
+- execution feasibility test katmanı
+- simulation modülü
+- dust execution modülü
+- atomic single-TX arb execution
+- landing / infra test disiplini
+- kill-switch ve staged validation yaklaşımı
+
+Bu nedenle proje:
+- trading product olarak kapandı
+- research / infra artifact olarak değerlidir
+
+---
+
+## 8. Gelecekte Ne Ancak “Yeni Proje” Sayılır?
+
+Aşağıdakiler continuation değil, yeni hypothesis olur:
+- farklı surface
+- farklı DEX kombinasyonu
+- less-contested route
+- new pool discovery
+- different market microstructure
+- CLOB / DLMM / non-obvious route
+- private relay ile tamamen yeni edge testi
+
+Yani:
+- mevcut route kapandı
+- yeni denenecek her şey yeni araştırma başlığıdır
+
+---
+
+## 9. Operasyonel Kapanış
+
+Yapılacaklar:
+- repo silinmez
+- archive korunur
+- final summary yazılır
+- çalışan modüller not edilir
+- fail nedeni açıkça belgelenir
+
+Arşiv etiketi:
+- route1_hard_kill
+- atomic_engine_pass_route_fail
+
+---
+
+## 10. Tek Cümlelik Nihai Özet
+
+Bu proje,
+“Solana public obvious DEX arbitrage route’u retail-access infra ile kârlı şekilde capture edilebilir mi?”
+sorusunu test etti.
+
+Cevap:
+HAYIR.
+
+Sebep:
+Execution altyapısı sonunda çalışsa bile route ekonomisi rekabet altında negatif kaldı.
+
+
+
+
+
+
+
+
 
 ## Sources
 
